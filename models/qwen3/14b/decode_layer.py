@@ -166,6 +166,26 @@ QKV_OK = 5  # split-K slices (atomic-add)  # 5 -> QKV_K_SLICE=1024 = normed slab
 QKV_K_SLICE = HIDDEN // QKV_OK  # 1280 K per split
 QKV_K_CHUNKS = QKV_K_SLICE // TK  # 5 inner TK chunks per split
 
+# AIV V-projection (V_PROJ_ON_AIV=1): dot-product / row_sum form on the VECTOR (AIV)
+# unit. out[:, n] = Σ_k normed_in[:,k]·wv[k,n] computed per output column as
+# Σ_{k-block} row_sum( normed_in_block ⊙ broadcast(wv[k-block, n]) ). The wv block is
+# transposed on-chip so each column n becomes a CONTIGUOUS [1,KC] row (avoids strided
+# GM column loads). Module-level so the tracer folds the literals.
+V_RS_NV = 16
+V_RS_NTILES = KV_HIDDEN // V_RS_NV  # 8 N sub-tiles (<= 10 v_tile_tids slots)
+V_RS_KC = 512
+
+# AIV K-projection (K_PROJ_ON_AIV=1): same row_sum form as V, but K needs its OWN
+# tiling. qk_norm consumes k_proj per 512-wide N-tile (deps on k_tile_tids[kt*QKV_OK +
+# 0..4], kt = head//4), so each AIV K task must be fanned into the 5 slots of the
+# N-tile it covers. That requires (tasks per N-tile) = QKV_N_TILE // K_RS_NV <= QKV_OK,
+# so K cannot reuse V_RS_NV. K_RS_NV=128 -> K_RS_TPN=4 (<=5), K_RS_NTILES=8.
+K_RS_NV = 16
+K_RS_NTILES = KV_HIDDEN // K_RS_NV       # 8 N sub-tiles
+K_RS_KC = 512
+K_RS_TPN = QKV_N_TILE // K_RS_NV         # 4 AIV tasks per qk_norm N-tile
+K_RS_PAD = QKV_OK - K_RS_TPN             # 1 padding slot per N-tile (QKV_OK=5)
+
 # ── Scope 2 · grouped-query attention (fused, PAGED) ──
 # SEQ_TILE = seq length per KV block. PINNED to the serving paged page_size (128):
 # decode reads KV from the PAGED pool via block_table, so one logical block must
@@ -298,6 +318,12 @@ assert N_PER_CAST_K * OUT_TN == MLP_K_SLICE
 # ──────────────────────────────────────────────────────────────────────────────
 # Monolithic JIT entry.
 # ──────────────────────────────────────────────────────────────────────────────
+
+# Prototype toggles: run the V / K projection on the VECTOR (AIV) unit (row_sum form)
+# instead of cube. Resolved at import (trace) time as module constants so the JIT
+# tracer picks the branch statically.
+_V_PROJ_ON_AIV = os.environ.get("V_PROJ_ON_AIV", "0") == "1"
+_K_PROJ_ON_AIV = os.environ.get("K_PROJ_ON_AIV", "0") == "1"
 
 
 @pl.jit.inline
@@ -455,59 +481,163 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                         q_proj = pl.assemble(q_proj, q_acc, [0, n0], atomic=pl.AtomicType.Add)
                 q_tile_tids[q_nt * QKV_OK + q_ks] = q_tid
 
-        # ── Scope 1: K projection — SPLIT-K + inner N/K tiling, SPMD (seed + atomic). ──
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="k_seed", deps=[prev_out_tids[_si] for _si in range(DOWN_ON)]) as k_seed_tid:
-            k_proj = pl.assemble(k_proj, pl.full([BATCH, KV_HIDDEN], dtype=pl.FP32, value=0.0), [0, 0])
-        for k_nt in pl.parallel(KV_ON):
-            k_n_region = k_nt * QKV_N_TILE
-            for k_ks in pl.range(QKV_OK):
-                k_k_base = k_ks * QKV_K_SLICE
+        # ── Scope 1: K projection. ──
+        # Mirrors V's row_sum AIV variant (toggle K_PROJ_ON_AIV). Same shape as V
+        # (normed_in @ wk -> [BATCH, KV_HIDDEN]) but K needs its OWN tiling (K_RS_*):
+        # qk_norm consumes k_proj per 512-wide N-tile (deps on k_tile_tids[kt*QKV_OK +
+        # 0..4], kt = head//4), so each AIV task is fanned into the 5 slots of the
+        # N-tile it covers — K_RS_TPN tasks per N-tile (<= QKV_OK), remaining slots
+        # padded with the last covering task.
+        if _K_PROJ_ON_AIV:
+            ks_tids = pl.array.create(K_RS_NTILES, pl.TASK_ID)
+            for ks_vn in pl.parallel(K_RS_NTILES):
+                ks_n0 = ks_vn * K_RS_NV
                 with pl.at(
                     level=pl.Level.CORE_GROUP,
-                    name_hint="k_proj",
-                    deps=[prev_normed_tids[0], prev_normed_tids[1], prev_normed_tids[2], prev_normed_tids[3], prev_normed_tids[4], k_seed_tid],
-                ) as k_tid:
-                    for n_sub in pl.range(N_SUB):
-                        n0 = k_n_region + n_sub * TN
-                        k_acc = pl.matmul(
-                            normed_in[:, k_k_base : k_k_base + TK],
-                            wk[layer_hidden_base + k_k_base : layer_hidden_base + k_k_base + TK, n0 : n0 + TN],
-                            out_dtype=pl.FP32,
+                    name_hint="k_proj_vec_rs",
+                    deps=[prev_normed_tids[_si] for _si in range(DOWN_ON)],
+                ) as ks_tid:
+                    ks_acc = pl.full([K_RS_NV, BATCH], dtype=pl.FP32, value=0.0)
+                    for ks_kb in pl.pipeline(HIDDEN // K_RS_KC, stage=2):
+                        ks_k0 = ks_kb * K_RS_KC
+                        ks_nblk = pl.cast(
+                            normed_in[:, ks_k0 : ks_k0 + K_RS_KC], target_type=pl.FP32
                         )
-                        for kc in pl.pipeline(1, QKV_K_CHUNKS, stage=2):
-                            kk = k_k_base + kc * TK
-                            k_acc = pl.matmul_acc(
-                                k_acc, normed_in[:, kk : kk + TK], wk[layer_hidden_base + kk : layer_hidden_base + kk + TK, n0 : n0 + TN]
+                        ks_wblk = pl.cast(
+                            wk[
+                                layer_hidden_base + ks_k0 : layer_hidden_base + ks_k0 + K_RS_KC,
+                                ks_n0 : ks_n0 + K_RS_NV,
+                            ],
+                            target_type=pl.FP32,
+                        )
+                        ks_wblk_t = pl.transpose(ks_wblk, 0, 1)  # [K_RS_NV, K_RS_KC]
+                        for ks_n in pl.range(K_RS_NV):
+                            ks_wrow = ks_wblk_t[ks_n : ks_n + 1, :]
+                            ks_s = pl.row_sum(pl.col_expand_mul(ks_nblk, ks_wrow))
+                            ks_s_row = pl.reshape(ks_s, [1, BATCH])
+                            ks_acc = pl.assemble(
+                                ks_acc, pl.add(ks_acc[ks_n : ks_n + 1, :], ks_s_row), [ks_n, 0]
                             )
-                        k_proj = pl.assemble(k_proj, k_acc, [0, n0], atomic=pl.AtomicType.Add)
-                k_tile_tids[k_nt * QKV_OK + k_ks] = k_tid
+                    ks_out = pl.transpose(ks_acc, 0, 1)  # [BATCH, K_RS_NV]
+                    k_proj = pl.assemble(k_proj, ks_out, [0, ks_n0])
+                ks_tids[ks_vn] = ks_tid
+            # Per-N-tile fan-out into qk_norm's slots (no min(): two unrolled loops).
+            for _kt in pl.unroll(KV_ON):
+                for _t in pl.unroll(K_RS_TPN):
+                    k_tile_tids[_kt * QKV_OK + _t] = ks_tids[_kt * K_RS_TPN + _t]
+                for _r in pl.unroll(K_RS_PAD):
+                    k_tile_tids[_kt * QKV_OK + K_RS_TPN + _r] = ks_tids[
+                        _kt * K_RS_TPN + (K_RS_TPN - 1)
+                    ]
+        else:
+            # Default: K on cube — SPLIT-K + inner N/K tiling, SPMD (seed + atomic).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="k_seed", deps=[prev_out_tids[_si] for _si in range(DOWN_ON)]) as k_seed_tid:
+                k_proj = pl.assemble(k_proj, pl.full([BATCH, KV_HIDDEN], dtype=pl.FP32, value=0.0), [0, 0])
+            for k_nt in pl.parallel(KV_ON):
+                k_n_region = k_nt * QKV_N_TILE
+                for k_ks in pl.range(QKV_OK):
+                    k_k_base = k_ks * QKV_K_SLICE
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="k_proj",
+                        deps=[prev_normed_tids[0], prev_normed_tids[1], prev_normed_tids[2], prev_normed_tids[3], prev_normed_tids[4], k_seed_tid],
+                    ) as k_tid:
+                        for n_sub in pl.range(N_SUB):
+                            n0 = k_n_region + n_sub * TN
+                            k_acc = pl.matmul(
+                                normed_in[:, k_k_base : k_k_base + TK],
+                                wk[layer_hidden_base + k_k_base : layer_hidden_base + k_k_base + TK, n0 : n0 + TN],
+                                out_dtype=pl.FP32,
+                            )
+                            for kc in pl.pipeline(1, QKV_K_CHUNKS, stage=2):
+                                kk = k_k_base + kc * TK
+                                k_acc = pl.matmul_acc(
+                                    k_acc, normed_in[:, kk : kk + TK], wk[layer_hidden_base + kk : layer_hidden_base + kk + TK, n0 : n0 + TN]
+                                )
+                            k_proj = pl.assemble(k_proj, k_acc, [0, n0], atomic=pl.AtomicType.Add)
+                    k_tile_tids[k_nt * QKV_OK + k_ks] = k_tid
 
-        # ── Scope 1: V projection — SPLIT-K + inner N/K tiling, SPMD (seed + atomic). ──
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="v_seed", deps=[prev_out_tids[_si] for _si in range(DOWN_ON)]) as v_seed_tid:
-            v_proj = pl.assemble(v_proj, pl.full([BATCH, KV_HIDDEN], dtype=pl.FP32, value=0.0), [0, 0])
-        for v_nt in pl.parallel(KV_ON):
-            v_n_region = v_nt * QKV_N_TILE
-            for v_ks in pl.range(QKV_OK):
-                v_k_base = v_ks * QKV_K_SLICE
+        # ── Scope 1: V projection. ──
+        # V-on-AIV prototype (toggle V_PROJ_ON_AIV=1): run V on the VECTOR (AIV) unit
+        # so it overlaps the cube-resident Q/K projections (Q stays the cube long-pole).
+        # V is the cleanest to offload — its only consumer is the inv_rms mul + bf16
+        # cast + paged v_cache scatter in rope_qkv (no qk-norm / no RoPE).
+        if _V_PROJ_ON_AIV:
+            # AIV V projection — DOT-PRODUCT / row_sum variant.
+            #     v_proj[:, n] = Σ_k normed_in[:, k] · wv[k, n]
+            # computed per output column as a sum over K-blocks of
+            #     row_sum( normed_in_block[BATCH,KC] ⊙ wv[k-block, n] broadcast ).
+            # Each wv K-block is loaded contiguously [KC,NV] and TRANSPOSED on-chip to
+            # [NV,KC] so column n becomes a contiguous [1,KC] row (the per-column scalar
+            # vector for col_expand_mul) — avoiding the strided column accesses of the
+            # rank-1 variant. Per-column partials accumulate into v_acc[:, n]. N is tiled
+            # into V_RS_NV-wide sub-tiles (<=10 tasks, for the v_tile_tids slots).
+            rs_tids = pl.array.create(V_RS_NTILES, pl.TASK_ID)
+            for rs_vn in pl.parallel(V_RS_NTILES):
+                rs_n0 = rs_vn * V_RS_NV
                 with pl.at(
                     level=pl.Level.CORE_GROUP,
-                    name_hint="v_proj",
-                    deps=[prev_normed_tids[0], prev_normed_tids[1], prev_normed_tids[2], prev_normed_tids[3], prev_normed_tids[4], v_seed_tid],
-                ) as v_tid:
-                    for n_sub in pl.range(N_SUB):
-                        n0 = v_n_region + n_sub * TN
-                        v_acc = pl.matmul(
-                            normed_in[:, v_k_base : v_k_base + TK],
-                            wv[layer_hidden_base + v_k_base : layer_hidden_base + v_k_base + TK, n0 : n0 + TN],
-                            out_dtype=pl.FP32,
-                        )
-                        for kc in pl.pipeline(1, QKV_K_CHUNKS, stage=2):
-                            kk = v_k_base + kc * TK
-                            v_acc = pl.matmul_acc(
-                                v_acc, normed_in[:, kk : kk + TK], wv[layer_hidden_base + kk : layer_hidden_base + kk + TK, n0 : n0 + TN]
+                    name_hint="v_proj_vec_rs",
+                    deps=[prev_normed_tids[_si] for _si in range(DOWN_ON)],
+                ) as rs_tid:
+                    # Accumulate TRANSPOSED: rs_acc[n, m] (= v_projᵀ for this N-tile). Each
+                    # row_sum result is [BATCH,1]; transposed to a [1,BATCH] row it lands in
+                    # rs_acc as a CONTIGUOUS row, avoiding the strided column-subview blayout
+                    # mismatch that a [16,NV] column write hits. Transposed back at the end.
+                    rs_acc = pl.full([V_RS_NV, BATCH], dtype=pl.FP32, value=0.0)
+                    for rs_kb in pl.pipeline(HIDDEN // V_RS_KC, stage=2):
+                        rs_k0 = rs_kb * V_RS_KC
+                        rs_nblk = pl.cast(
+                            normed_in[:, rs_k0 : rs_k0 + V_RS_KC], target_type=pl.FP32
+                        )  # [BATCH, V_RS_KC]
+                        rs_wblk = pl.cast(
+                            wv[
+                                layer_hidden_base + rs_k0 : layer_hidden_base + rs_k0 + V_RS_KC,
+                                rs_n0 : rs_n0 + V_RS_NV,
+                            ],
+                            target_type=pl.FP32,
+                        )  # [V_RS_KC, V_RS_NV]
+                        rs_wblk_t = pl.transpose(rs_wblk, 0, 1)  # [V_RS_NV, V_RS_KC]
+                        for rs_n in pl.range(V_RS_NV):
+                            rs_wrow = rs_wblk_t[rs_n : rs_n + 1, :]  # [1, V_RS_KC] contiguous
+                            # prod[m,k] = nblk[m,k]·wv[k0+k, n]; Σ_k via row_sum -> [BATCH,1]
+                            rs_s = pl.row_sum(pl.col_expand_mul(rs_nblk, rs_wrow))
+                            rs_s_row = pl.reshape(rs_s, [1, BATCH])  # [BATCH,1]->[1,BATCH] (row_sum out is col_major; reshape, not ttrans)
+                            rs_acc = pl.assemble(
+                                rs_acc, pl.add(rs_acc[rs_n : rs_n + 1, :], rs_s_row), [rs_n, 0]
                             )
-                        v_proj = pl.assemble(v_proj, v_acc, [0, n0], atomic=pl.AtomicType.Add)
-                v_tile_tids[v_nt * QKV_OK + v_ks] = v_tid
+                    rs_out = pl.transpose(rs_acc, 0, 1)  # [BATCH, V_RS_NV]
+                    v_proj = pl.assemble(v_proj, rs_out, [0, rs_n0])
+                rs_tids[rs_vn] = rs_tid
+            for _vi in pl.unroll(KV_ON * QKV_OK):
+                v_tile_tids[_vi] = rs_tids[_vi % V_RS_NTILES]
+        else:
+            # Default: V on cube — SPLIT-K + inner N/K tiling, SPMD (seed + atomic).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="v_seed", deps=[prev_out_tids[_si] for _si in range(DOWN_ON)]) as v_seed_tid:
+                v_proj = pl.assemble(v_proj, pl.full([BATCH, KV_HIDDEN], dtype=pl.FP32, value=0.0), [0, 0])
+            for v_nt in pl.parallel(KV_ON):
+                v_n_region = v_nt * QKV_N_TILE
+                for v_ks in pl.range(QKV_OK):
+                    v_k_base = v_ks * QKV_K_SLICE
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="v_proj",
+                        deps=[prev_normed_tids[0], prev_normed_tids[1], prev_normed_tids[2], prev_normed_tids[3], prev_normed_tids[4], v_seed_tid],
+                    ) as v_tid:
+                        for n_sub in pl.range(N_SUB):
+                            n0 = v_n_region + n_sub * TN
+                            v_acc = pl.matmul(
+                                normed_in[:, v_k_base : v_k_base + TK],
+                                wv[layer_hidden_base + v_k_base : layer_hidden_base + v_k_base + TK, n0 : n0 + TN],
+                                out_dtype=pl.FP32,
+                            )
+                            for kc in pl.pipeline(1, QKV_K_CHUNKS, stage=2):
+                                kk = v_k_base + kc * TK
+                                v_acc = pl.matmul_acc(
+                                    v_acc, normed_in[:, kk : kk + TK], wv[layer_hidden_base + kk : layer_hidden_base + kk + TK, n0 : n0 + TN]
+                                )
+                            v_proj = pl.assemble(v_proj, v_acc, [0, n0], atomic=pl.AtomicType.Add)
+                    v_tile_tids[v_nt * QKV_OK + v_ks] = v_tid
 
         # ── Scope 2 prep: build the dense block-level work list on an AIV task. ──
         # Inputs are external (seq_lens) — no deps.
