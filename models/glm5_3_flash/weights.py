@@ -313,7 +313,7 @@ def _local_intermediate_slice(
     """Keep one TP rank's channels of the fused gate/up layout and of ``down``."""
     if gate_up.shape[0] != 2 * intermediate:
         raise ValueError(f"fused gate/up height {gate_up.shape[0]} != 2 * {intermediate}")
-    if local_inter <= 0 or intermediate % local_inter or (tp_rank + 1) * local_inter > intermediate:
+    if not 0 <= tp_rank or local_inter <= 0 or intermediate % local_inter or (tp_rank + 1) * local_inter > intermediate:
         raise ValueError(f"tp_rank {tp_rank} with local_inter {local_inter} does not fit {intermediate}")
     start = tp_rank * local_inter
     gate_rows = gate_up[start : start + local_inter]
@@ -555,10 +555,18 @@ if __name__ == "__main__":
         raise AssertionError("a missing scale should have been rejected")
 
     # Shard geometry is validated rather than silently slicing short.
+    moe_inter = FLASH.moe_intermediate_size
+    fused_gu = torch.cat([shared_pieces[0], shared_pieces[1]], dim=0)
+    fused_gu_scale = torch.cat([shared_pieces[3].reshape(-1), shared_pieces[4].reshape(-1)])
     for bad_call in (
         lambda: shard_shared_expert(sparse_fused, 3, TP_SIZE, TP_SIZE),
         lambda: shard_dense_mlp(sparse_fused, 0, -1, TP_SIZE),
         lambda: shard_dense_mlp(sparse_fused, 0, 0, TP_SIZE, intermediate=DENSE_INTER + 32),
+        # The private helper is reachable directly and carries its own guard.
+        lambda: _local_intermediate_slice(
+            fused_gu, fused_gu_scale, shared_pieces[2], shared_pieces[5].reshape(-1),
+            intermediate=moe_inter, local_inter=moe_inter // TP_SIZE, tp_rank=-1,
+        ),
     ):
         try:
             bad_call()
