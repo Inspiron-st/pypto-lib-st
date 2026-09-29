@@ -251,7 +251,13 @@ def moe_dispatch(
     recv_route: pl.Tensor[[LANE_ROWS, 1], pl.INT32],
     expert_offsets: pl.Tensor[[N_LOCAL_EXPERTS + 1], pl.INT32],
 ):
-    """Stable expert-major regroup of this rank's arrived routes."""
+    """Stable expert-major regroup of this rank's arrived routes.
+
+    Capacity tails are never read: every loop here and in ``expert_routed`` is
+    bounded by an exact count (``route_count`` here, the expert offsets there),
+    so rows a call did not write — which may decode as NaN/Inf — are never
+    consumed.
+    """
     n_routes = pl.cast(pl.read(route_count, [0]), pl.INDEX)
     if n_routes < 0:
         n_routes = pl.cast(0, pl.INDEX)
