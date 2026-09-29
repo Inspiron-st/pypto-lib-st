@@ -575,6 +575,31 @@ if __name__ == "__main__":
         else:
             raise AssertionError("invalid shard geometry should have been rejected")
 
+    # The .safetensors branch of ``load_tensors`` is the one loader path with no
+    # coverage when the optional package is absent; round-trip a small shard
+    # through it whenever the package is present.
+    try:
+        from safetensors.torch import save_file  # noqa: PLC0415
+    except ImportError:
+        print("[GOLDEN] skip  weights safetensors reader (safetensors not installed)")
+    else:
+        import tempfile  # noqa: PLC0415
+
+        probe = {
+            "probe.weight": torch.arange(24, dtype=torch.int8).reshape(4, 6),
+            "probe.weight_scale": torch.linspace(0.1, 1.0, 4).reshape(4, 1),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            save_file(probe, str(Path(tmp) / "shard-0.safetensors"))
+            loaded = load_tensors(tmp)
+            if not torch.equal(loaded["probe.weight"], probe["probe.weight"]):
+                raise AssertionError("safetensors reader lost the weight payload")
+            if not torch.equal(
+                _scale_of(loaded, "probe.weight"), probe["probe.weight_scale"].reshape(-1)
+            ):
+                raise AssertionError("safetensors reader did not flatten the [out, 1] scale")
+        print("[GOLDEN] PASS weights (safetensors round-trip)")
+
     print(
         f"[GOLDEN] PASS weights (routed 32 experts over EP{routed_ep}, dense/shared TP{TP_SIZE})"
     )
