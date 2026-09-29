@@ -44,6 +44,14 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
 
+# ``--tp`` / ``--ep`` are read from argv by config.py at import time and every
+# sub-kernel inherits the frozen shapes. config.py's own default is the 16-die
+# deployment shape, while the CI sweeps run each entry at its default world size
+# (ep2 / 2-card, see ``# ci: devices=2``), so pin that bring-up default before
+# the first ``models.glm5_3_flash`` import when the command line pins neither axis.
+if not any(tok in ("--tp", "--ep") or tok.startswith(("--tp=", "--ep=")) for tok in sys.argv):
+    sys.argv += ["--tp", "2", "--ep", "2"]
+
 from models.glm5_3_flash.config import D, EP_SIZE, T_DYN, TP_SIZE
 
 # This directory owns a ``golden.py`` reference module, so the repository-root
