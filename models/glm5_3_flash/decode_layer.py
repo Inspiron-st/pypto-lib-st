@@ -284,8 +284,9 @@ def golden_decode_layer(tensors):
         # +/-1 LSB on rounding boundaries — the gate test tolerates that, but a
         # composed ``y`` comparison amplifies it. Mirror the kernel so this test
         # isolates the composition, not the quant boundary.
-        xg = tensors["x_mixed"][r].float() * tensors["norm_weight"][r].float()
-        inverse_rms = torch.rsqrt(xg.square().mean(dim=-1, keepdim=True) + FLASH.rms_norm_eps)
+        x_f = tensors["x_mixed"][r].float()
+        xg = x_f * tensors["norm_weight"][r].float()
+        inverse_rms = torch.rsqrt(x_f.square().mean(dim=-1, keepdim=True) + FLASH.rms_norm_eps)
         x_i8, dequant = quantize_per_token_int8(xg)
         x_int8[r], x_scale[r] = x_i8, dequant * inverse_rms
     if num_tokens < T:

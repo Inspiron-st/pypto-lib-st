@@ -203,7 +203,7 @@ def moe_arrive(
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_ep_arrive_prefix", deps=[wait_tid]) as prefix_tid:
         running = pl.cast(0, pl.INDEX)
-        for s in pl.range(N_RANKS):
+        for s in pl.range(num_ranks):
             pl.write(src_base, [s], pl.cast(running, pl.INT32))
             n_rows = pl.cast(pl.read(lane_count, [s, 0]), pl.INDEX)
             for i in pl.range(n_rows):
@@ -223,7 +223,7 @@ def moe_arrive(
             running = running + n_rows
         pl.write(arrive_total, [0], pl.cast(running, pl.INT32))
 
-    with pl.spmd(N_RANKS, name_hint="moe_ep_arrive_copy", deps=[prefix_tid]) as _arrive_tid:
+    with pl.spmd(num_ranks, name_hint="moe_ep_arrive_copy", deps=[prefix_tid]) as _arrive_tid:
         s = pl.tile.get_block_idx()
         base = pl.cast(pl.read(src_base, [s]), pl.INDEX)
         n_rows = pl.cast(pl.read(lane_count, [s, 0]), pl.INDEX)

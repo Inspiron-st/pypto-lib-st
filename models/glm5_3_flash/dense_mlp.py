@@ -115,7 +115,8 @@ def dense_mlp(
         n_act_blocks = (valid_rows + DN_ROWS_PER_BLOCK - 1) // DN_ROWS_PER_BLOCK
         for row_block in pl.spmd(n_act_blocks, name_hint="dn_gate_up_act_q"):
             row0 = row_block * DN_ROWS_PER_BLOCK
-            x_scale_blk = pl.slice(x_scale, [DN_ROW_PAD, 1], [ts0 + row0, 0], valid_shape=[DN_ROWS_PER_BLOCK, 1])
+            blk_rows = pl.min(pl.cast(DN_ROWS_PER_BLOCK, pl.INDEX), valid_rows - row0)
+            x_scale_blk = pl.slice(x_scale, [DN_ROW_PAD, 1], [ts0 + row0, 0], valid_shape=[blk_rows, 1])
             row_amax = pl.full([1, DN_ROW_PAD], dtype=pl.FP32, value=INT8_AMAX_EPS)
             for part in pl.pipeline(LOCAL_DENSE_INTER // ACT_INTER_TILE, stage=1):
                 n0 = part * ACT_INTER_TILE
@@ -143,6 +144,10 @@ def dense_mlp(
                     up_fp32 = pl.maximum(pl.minimum(up_fp32, SWIGLU_LIMIT), -SWIGLU_LIMIT)
                 sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_fp32)), 1.0))
                 gated = pl.mul(pl.mul(gate_fp32, sigmoid), up_fp32)
+                # A 1-row trailing block reads one scale row; re-widen its dummy
+                # second row so the store keeps its static slice. That row is
+                # masked at the w2 output.
+                gated = pl.set_validshape(gated, DN_ROWS_PER_BLOCK, ACT_INTER_TILE)
                 chunk_amax = pl.reshape(pl.row_max(pl.abs(gated)), [1, DN_ROW_PAD])
                 row_amax = pl.maximum(row_amax, chunk_amax)
                 h_fp32[row0 : row0 + DN_ROWS_PER_BLOCK, n0 : n0 + ACT_INTER_TILE] = gated[0:DN_ROWS_PER_BLOCK, :]

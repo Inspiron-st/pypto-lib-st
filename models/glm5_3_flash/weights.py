@@ -68,8 +68,6 @@ from models.glm5_3_flash.config import (
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
-LOCAL_DENSE_INTER = DENSE_INTER // TP_SIZE
-
 # Candidate checkpoint spellings, most specific first. ``{e}`` is the global
 # expert id; templates without it are for the single shared/dense FFN.
 ROLES: dict[str, tuple[str, ...]] = {
@@ -313,8 +311,10 @@ def _local_intermediate_slice(
     tp_rank: int,
 ) -> FfnShard:
     """Keep one TP rank's channels of the fused gate/up layout and of ``down``."""
-    if local_inter * 2 > gate_up.shape[0]:
-        raise ValueError("local_inter exceeds the fused gate/up height")
+    if gate_up.shape[0] != 2 * intermediate:
+        raise ValueError(f"fused gate/up height {gate_up.shape[0]} != 2 * {intermediate}")
+    if local_inter <= 0 or intermediate % local_inter or (tp_rank + 1) * local_inter > intermediate:
+        raise ValueError(f"tp_rank {tp_rank} with local_inter {local_inter} does not fit {intermediate}")
     start = tp_rank * local_inter
     gate_rows = gate_up[start : start + local_inter]
     up_rows = gate_up[intermediate + start : intermediate + start + local_inter]
@@ -347,6 +347,8 @@ def shard_shared_expert(
     """TP-slice the shared expert's fused layout for one rank."""
     if tp_size not in SUPPORTED_TP_SIZES:
         raise ValueError(f"tp_size must be one of {SUPPORTED_TP_SIZES}, got {tp_size}")
+    if not 0 <= tp_rank < tp_size:
+        raise ValueError(f"tp_rank must be in [0, {tp_size}), got {tp_rank}")
     local = local_inter if local_inter is not None else intermediate // tp_size
     if intermediate % tp_size:
         raise ValueError(f"shared intermediate {intermediate} does not divide TP{tp_size}")
@@ -367,13 +369,16 @@ def shard_dense_mlp(
     tp_size: int,
     *,
     intermediate: int = DENSE_INTER,
-    local_inter: int = LOCAL_DENSE_INTER,
+    local_inter: int | None = None,
 ) -> FfnShard:
     """TP-slice one dense layer's MLP for one rank (layers 0-2)."""
     if tp_size not in SUPPORTED_TP_SIZES:
         raise ValueError(f"tp_size must be one of {SUPPORTED_TP_SIZES}, got {tp_size}")
+    if not 0 <= tp_rank < tp_size:
+        raise ValueError(f"tp_rank must be in [0, {tp_size}), got {tp_rank}")
     if intermediate % tp_size:
         raise ValueError(f"dense intermediate {intermediate} does not divide TP{tp_size}")
+    local_inter = local_inter if local_inter is not None else intermediate // tp_size
     prefix = layer_prefix(layer_id)
     gate_up, gate_up_scale, down, down_scale = _fused_ffn(
         tensors, prefix, ("dense_fused", "dense_fused_down", "dense_gate", "dense_up", "dense_down")
@@ -548,6 +553,19 @@ if __name__ == "__main__":
         pass
     else:
         raise AssertionError("a missing scale should have been rejected")
+
+    # Shard geometry is validated rather than silently slicing short.
+    for bad_call in (
+        lambda: shard_shared_expert(sparse_fused, 3, TP_SIZE, TP_SIZE),
+        lambda: shard_dense_mlp(sparse_fused, 0, -1, TP_SIZE),
+        lambda: shard_dense_mlp(sparse_fused, 0, 0, TP_SIZE, intermediate=DENSE_INTER + 32),
+    ):
+        try:
+            bad_call()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid shard geometry should have been rejected")
 
     print(
         f"[GOLDEN] PASS weights (routed 32 experts over EP{routed_ep}, dense/shared TP{TP_SIZE})"

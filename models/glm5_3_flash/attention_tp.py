@@ -29,8 +29,8 @@ call's readers, and ``consumed`` at the bottom fences this call's readers before
 the next publish.
 
 The group is the whole EP world (``group_base`` 0, ``DP = 1``), which is the
-single-node A3 deployment; a DP split would set ``group_base`` to the group's
-first rank and index ``arrived`` by group-local rank.
+single-node A3 deployment; ``EP_SIZE == TP_SIZE`` is enforced at import so a DP
+split fails loudly instead of summing each TP shard once per replica.
 
 The L3 entry runs the reduction twice over one set of windows — a single call
 would not exercise the reuse/consumed fences — and compares both passes against
@@ -54,6 +54,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 TP_CHUNK = 512           # reduction tile width; D is a whole number of these
 TP_WORKERS = 8           # AIV blocks walking the row/chunk tiles
 TP_CAP_TEST = 16         # window capacity exercised by the test entry
+
+if EP_SIZE != TP_SIZE:
+    raise ValueError(
+        f"tp_all_reduce reduces over the EP world, so EP{EP_SIZE} with TP{TP_SIZE} would sum "
+        "each TP shard once per DP replica. Reduce over the TP group (TP_SIZE peers at "
+        "group_base) before enabling DP > 1."
+    )
 
 
 def golden_tp_all_reduce(partials: torch.Tensor) -> torch.Tensor:
