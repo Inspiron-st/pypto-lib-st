@@ -258,7 +258,12 @@ if __name__ == "__main__":
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
-            "output": ratio_reldiff(diff_thd=3e-3, pct_thd=0.01),
+            # The kernel only writes rows < num_tokens; the capacity tail of
+            # ``output`` is never touched and may decode as NaN/Inf, so clip the
+            # comparison to the active extent (valid_axis=1: the rank axis
+            # precedes the token axis).
+            "output": ratio_reldiff(diff_thd=3e-3, pct_thd=0.01,
+                                    valid_rows=args.num_tokens, valid_axis=1),
         },
     )
     if not result.passed:
