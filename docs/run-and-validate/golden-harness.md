@@ -169,6 +169,18 @@ If neither `golden_fn` nor `golden_data` is provided, the runtime can still
 execute, but validation is explicitly reported as skipped. Such a run is not
 a correctness check.
 
+For an input contract that shapes and dtypes alone cannot express, pass
+`input_validator=check_inputs` to `run`. The callback receives a dictionary of
+the actual dispatch tensors and effective Python scalar values after input
+generation or replay, before golden computation and device execution. It must
+only read these values. Raising `AssertionError` or `ValueError` returns a
+failed `RunResult` without dispatching the kernel.
+
+The check also runs when there is no golden, when `golden_data` supplies stored
+outputs, and when `runtime_dir` reuses an artifact. `compile_only` skips it
+because no inputs are allocated. The callback runs once before the correctness
+dispatch; it does not recheck scalar values advanced during benchmarking.
+
 ## Handle RunResult
 
 `run` returns:

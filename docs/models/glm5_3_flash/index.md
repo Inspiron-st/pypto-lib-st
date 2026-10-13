@@ -94,6 +94,27 @@ which 19.5 GB is the routed experts; the remaining budget on a 64 GiB die
 (~61.3 GiB visible) goes to the hybrid cache, which is the binding constraint and
 is sized by the cache-manager work item.
 
+### MoE block TP inputs
+
+`decode_layer.py` and `prefill_layer.py` compose routed experts with a
+TP-sharded shared expert. Every rank in the TP group must receive the same
+active activation rows, in the same token order, along with replicated RMSNorm
+weights, router weights and correction bias. The shared expert slices the
+intermediate channels and sums the ranks' partial outputs for each token.
+`EP_SIZE == TP_SIZE` fixes the reduction group; it does not replicate inputs.
+
+The standalone entries call `moe_contract.validate_tp_inputs` before golden
+computation and device dispatch through `golden.run(input_validator=...)`.
+The check also runs when replaying saved inputs or golden outputs, and it
+ignores capacity rows after `num_tokens`. The routing fixture fixes eight
+global experts and replicates that correction bias across all ranks for
+TP1/2/4/8/16.
+
+The raw `l2_*_layer` and `l3_*_layer` APIs retain this input precondition.
+Custom host callers should use `validate_tp_inputs` before dispatch. An upstream
+step that already produces replicated activations needs no additional gather;
+token-sharded inputs must be gathered or otherwise redistributed first.
+
 ## What is quantized
 
 Activations are quantized **dynamically per token** the way the a2a3 W8A8 sibling

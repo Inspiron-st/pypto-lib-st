@@ -10,12 +10,15 @@
 
 Same clamped SwiGLU as a routed expert at ``moe_intermediate_size = 2048``
 (``n_shared_experts = 1``), but with no routing weight and no dispatch: it runs on
-the rank's own token rows while the routed half is still in flight, which is what
+the rank's token rows while the routed half is still in flight, which is what
 hides part of the all-to-all latency.
 
 The shared expert's weights are TP-sharded on the intermediate axis, so each rank
 computes ``MOE_INTER / TP_SIZE`` channels and the result joins the routed output in
-the same reduction.
+the same reduction. That reduction adds row-parallel partials of *one* activation,
+so every rank of the TP group must hand this kernel the same token rows: the
+deployment replicates the batch across the group, and a caller that gave each rank
+its own tokens would sum unrelated rows.
 
 Unlike the DeepSeek-V4 sibling (separate ``w1``/``w3`` tensors), the GLM-5.3-Flash
 W8A8 checkpoint stores one fused ``w_gate_up [2 * LOCAL_MOE_INTER, D]``: the gate

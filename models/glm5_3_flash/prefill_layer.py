@@ -15,10 +15,12 @@ exactly as ``decode_layer.py`` composes them at decode scale:
 * the **routed** branch is expert-parallel — ``prefill_moe.py`` owns the whole
   count/pack -> exchange -> experts -> scatter-back -> TOPK-sum path at the
   serving capacity model and leaves the completed FP32 sum in ``routed``.
-* the **shared** expert runs on every rank over its own tokens but is sharded on
-  the intermediate axis, so each rank holds one row-parallel summand of the full
-  hidden width. ``expert_shared.py`` computes the shard; ``attention_tp.py``'s
-  ``tp_all_reduce`` sums the group's shards into BF16.
+* the **shared** expert is sharded on the intermediate axis, so each rank holds one
+  row-parallel summand of the full hidden width. The summands only add up to that
+  width while every rank runs its slice of the **same** activation rows: the TP
+  caller replicates the token batch across the TP group (``EP_SIZE == TP_SIZE``,
+  ``DP == 1``). ``expert_shared.py`` computes the
+  shard; ``attention_tp.py``'s ``tp_all_reduce`` sums the group's shards into BF16.
 
 ``moe_layer_add`` then adds the two, with the inactive capacity rows written as
 zeros. The router is the head of the block, so the entry runs ``moe_gate``
@@ -44,10 +46,15 @@ import torch
 
 # ``--tp`` / ``--ep`` are read from argv by config.py at import time and every
 # sub-kernel inherits the frozen shapes. config.py's own default is the 16-die
-# deployment shape, while the CI sweeps run each entry at its default world size
-# (ep2 / 2-card, see ``# ci: devices=2``), so pin that bring-up default before
-# the first ``models.glm5_3_flash`` import when the command line pins neither axis.
-if not any(tok in ("--tp", "--ep") or tok.startswith(("--tp=", "--ep=")) for tok in sys.argv):
+# deployment shape, while the CI sweeps run this entry at its default world size
+# (ep2 / 2-card, see ``# ci: devices=2``), so a standalone run pins that bring-up
+# default before the first ``models.glm5_3_flash`` import when the command line
+# pins neither axis. Only a standalone run may: an *import* must not repoint the
+# importing process, whose config.py may already be frozen at its own default,
+# or the effect would silently depend on import order.
+if __name__ == "__main__" and not any(
+    tok in ("--tp", "--ep") or tok.startswith(("--tp=", "--ep=")) for tok in sys.argv
+):
     sys.argv += ["--tp", "2", "--ep", "2"]
 
 from models.glm5_3_flash.attention_tp import tp_all_reduce
@@ -65,6 +72,7 @@ from models.glm5_3_flash.decode_moe import gen_routed_weight
 from models.glm5_3_flash.expert_routed import expert_routed
 from models.glm5_3_flash.expert_shared import LOCAL_MOE_INTER, expert_shared
 from models.glm5_3_flash.gate import moe_gate
+from models.glm5_3_flash.moe_contract import assert_replicated_batch, make_correction_bias, validate_tp_inputs
 from models.glm5_3_flash.prefill_moe import (
     AUX_PAD,
     COUNT_PAD,
@@ -137,7 +145,7 @@ def l2_prefill_layer(
     my_rank: pl.Scalar[pl.INT32],
     epoch: pl.Scalar[pl.INT32],
 ):
-    """One rank's orchestration of both branches over a sparse layer."""
+    """One rank's orchestration; active inputs and norm/router weights are TP-replicated."""
     send_counts = pl.create_tensor([N_RANKS, 1], dtype=pl.INT32)
     recv_expert_counts = pl.create_tensor([N_RANKS, N_LOCAL_EXPERTS], dtype=pl.INT32)
     expert_counts = pl.create_tensor([N_LOCAL_EXPERTS, 1], dtype=pl.INT32)
@@ -219,7 +227,12 @@ def l3_prefill_layer(
     num_tokens: pl.Scalar[pl.INT32],
     num_ranks: pl.Scalar[pl.INT32],
 ):
-    """Launch one rank's layer orchestration per chip, sharing the window buffers."""
+    """Launch each rank over one replicated TP batch and sharded expert weights.
+
+    The caller must supply identical active ``x_mixed`` rows and norm/router
+    weights on every rank. Host callers can use ``validate_tp_inputs`` before
+    dispatch; the standalone harness applies it independently of the golden.
+    """
     lane_x_buf = pld.alloc_window_buffer([TOTAL_CAP, D], dtype=pl.INT8)
     lane_aux_buf = pld.alloc_window_buffer([TOTAL_CAP, AUX_PAD], dtype=pl.FP32)
     lane_count_buf = pld.alloc_window_buffer([N_RANKS, COUNT_PAD], dtype=pl.INT32)
@@ -262,7 +275,9 @@ def golden_prefill_layer(tensors):
 
     The routed half is ``prefill_moe``'s golden; the shared half reuses
     ``expert_shared``'s golden per rank and then ``attention_tp``'s stack
-    reduction, so every number has exactly one reference implementation.
+    reduction, so every number has exactly one reference implementation. Each
+    rank's shared shard is a partial of the one replicated batch the fixture
+    hands every rank, which is what makes the group sum the full-width expert.
     """
     from models.glm5_3_flash.attention_tp import golden_tp_all_reduce
     from models.glm5_3_flash.expert_shared import golden_expert_shared_fn
@@ -270,6 +285,7 @@ def golden_prefill_layer(tensors):
     from models.glm5_3_flash.quantization import quantize_per_token_int8
 
     num_tokens = max(0, min(T, int(tensors.get("num_tokens", T))))
+    validate_tp_inputs(tensors)
 
     # Block head, per rank, with the same torch references gate.py's test uses.
     route_indices = torch.zeros(N_RANKS, T, TOPK, dtype=torch.int32)
@@ -336,37 +352,62 @@ def build_tensor_specs(num_tokens=T, *, num_ranks=EP_SIZE):
 
     num_tokens = max(0, min(T, int(num_tokens)))
 
-    def gen_shared(shape, dequant_std, chan_cv):
-        w = torch.randn(*shape) * torch.exp(chan_cv * torch.randn(*shape[:-1], 1))
-        amax = w.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
+    def quantize_rows(weight, dequant_std):
+        """Symmetric per-output-channel INT8 quant, rescaled to ``dequant_std``."""
+        amax = weight.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
         s = amax / INT8_SCALE_MAX
-        w_i8 = torch.round(w / s).clamp_(-INT8_SCALE_MAX, INT8_SCALE_MAX).to(torch.int8)
+        w_i8 = torch.round(weight / s).clamp_(-INT8_SCALE_MAX, INT8_SCALE_MAX).to(torch.int8)
         s = (s.squeeze(-1) * (dequant_std / (w_i8.float() * s).std())).float()
         return w_i8, s
+
+    # The shared expert is TP-sharded, so the fixture quantizes the checkpoint's
+    # *global* tensor and slices it the way ``weights._local_intermediate_slice``
+    # does: the fused gate/up keeps a gate block followed by an up block, and
+    # ``w_down`` loses columns while every hidden row survives -- which is why its
+    # per-output-channel scale is the whole ``[D]`` vector on every rank.
+    def gen_fused_shards(dequant_std, chan_cv):
+        w = torch.randn(2 * MOE_INTER, D) * torch.exp(chan_cv * torch.randn(2 * MOE_INTER, 1))
+        w_i8, s = quantize_rows(w, dequant_std)
+        fused, fused_scale = [], []
+        for r in range(N_RANKS):
+            start, stop = r * LOCAL_MOE_INTER, (r + 1) * LOCAL_MOE_INTER
+            fused.append(torch.cat([w_i8[start:stop], w_i8[MOE_INTER + start:MOE_INTER + stop]]))
+            fused_scale.append(torch.cat([s[start:stop], s[MOE_INTER + start:MOE_INTER + stop]]))
+        return torch.stack(fused), torch.stack(fused_scale)
+
+    def gen_down_shards(dequant_std, chan_cv):
+        w = torch.randn(D, MOE_INTER) * torch.exp(chan_cv * torch.randn(D, 1))
+        w_i8, s = quantize_rows(w, dequant_std)
+        shards = torch.stack(
+            [w_i8[:, r * LOCAL_MOE_INTER : (r + 1) * LOCAL_MOE_INTER] for r in range(N_RANKS)]
+        )
+        return shards, s.unsqueeze(0).expand(N_RANKS, D).contiguous()
 
     gen = torch.Generator().manual_seed(7)
     # The hyper-connection side is torch-only by design: fold a seeded BF16
     # stream with the golden's mHC references into the sublayer input, so no
     # non-MoE kernel has to exist for the block to be testable.
+    #
+    # One token batch, replicated to every rank. The shared expert's shards are
+    # row-parallel partials of *one* activation, so ``tp_all_reduce``'s group sum
+    # is the full-width expert only while every rank runs the same rows — which is
+    # the caller's input contract under EP == TP / DP == 1. A per-rank distinct
+    # batch would make the composed ``y`` a sum over unrelated tokens with kernel
+    # and golden agreeing, so the fixture replicates and the golden asserts it.
     from models.glm5_3_flash.golden import hc_mixes, hc_pre, hc_seed
 
-    emb = torch.randn(N_RANKS, T, D, generator=gen).to(torch.bfloat16)
-    hc_fn = torch.randn(N_RANKS, MIX_HC, HC_DIM, generator=gen).to(torch.bfloat16)
-    hc_scale = torch.rand(N_RANKS, 3, generator=gen)
-    hc_base = torch.randn(N_RANKS, MIX_HC, generator=gen)
+    emb = torch.randn(T, D, generator=gen).to(torch.bfloat16)
+    hc_fn = torch.randn(MIX_HC, HC_DIM, generator=gen).to(torch.bfloat16)
+    hc_scale = torch.rand(3, generator=gen)
+    hc_base = torch.randn(MIX_HC, generator=gen)
     with torch.no_grad():
         x_hc = hc_seed(emb)
-        pre_mixes = torch.stack(
-            [hc_mixes(x_hc[r], hc_fn[r], hc_scale[r], hc_base[r])[0] for r in range(N_RANKS)]
-        )
-        x_mixed = torch.stack([hc_pre(x_hc[r], pre_mixes[r]) for r in range(N_RANKS)])
-
-    def init_correction_bias():
-        bias = torch.full((N_RANKS, N_EXPERTS), -5.0)
-        for r in range(N_RANKS):
-            for loc in range(TOPK // N_RANKS):
-                bias[r, r * N_LOCAL_EXPERTS + loc] = 5.0
-        return bias
+        pre_mix = hc_mixes(x_hc, hc_fn, hc_scale, hc_base)[0]
+        x_row = hc_pre(x_hc, pre_mix)
+        x_mixed = x_row.unsqueeze(0).expand(N_RANKS, *x_row.shape).contiguous()
+    # The router is replicated as well: only the routed experts are EP-sharded.
+    gate_row = torch.randn(N_EXPERTS, D, generator=gen) / (D ** 0.5)
+    gate_weight = gate_row.unsqueeze(0).expand(N_RANKS, *gate_row.shape).contiguous()
 
     ROUTED_DEQUANT_STD = {"w1": 2.47e-2, "w2": 2.44e-2}
     SHARED_DEQUANT_STD = {"w1": 1.71e-2, "w2": 1.68e-2}
@@ -376,25 +417,18 @@ def build_tensor_specs(num_tokens=T, *, num_ranks=EP_SIZE):
     w2_i8, w2_s = gen_routed_weight(
         (N_RANKS, N_LOCAL_EXPERTS, D, MOE_INTER), ROUTED_DEQUANT_STD["w2"]
     )
-    shared_gu_i8, shared_gu_s = gen_shared(
-        (N_RANKS, 2 * LOCAL_MOE_INTER, D), SHARED_DEQUANT_STD["w1"], 0.50
-    )
-    shared_w2_i8, shared_w2_s = gen_shared(
-        (N_RANKS, D, LOCAL_MOE_INTER), SHARED_DEQUANT_STD["w2"], 0.33
-    )
+    shared_gu_i8, shared_gu_s = gen_fused_shards(SHARED_DEQUANT_STD["w1"], 0.50)
+    shared_w2_i8, shared_w2_s = gen_down_shards(SHARED_DEQUANT_STD["w2"], 0.33)
 
     return [
         TensorSpec("x_mixed", [N_RANKS, T, D], torch.bfloat16, init_value=lambda: x_mixed),
         TensorSpec("norm_weight", [N_RANKS, D], torch.bfloat16,
                    init_value=lambda: torch.ones(N_RANKS, D, dtype=torch.bfloat16)),
         TensorSpec("gate_weight", [N_RANKS, N_EXPERTS, D], torch.bfloat16,
-                   init_value=lambda: torch.randn(N_RANKS, N_EXPERTS, D, generator=gen) / (D ** 0.5)),
-        # Zero the router's top-k ambiguity: four experts per rank carry a +10
-        # score gap, so kernel and golden must select the same eight. Otherwise a
-        # legal near-tie swap changes which experts contribute and masks the
-        # composition under test behind router noise.
+                   init_value=lambda: gate_weight),
+        # One global top-8 expert set, replicated across the TP group.
         TensorSpec("correction_bias", [N_RANKS, N_EXPERTS], torch.float32,
-                   init_value=init_correction_bias),
+                   init_value=lambda: make_correction_bias(N_RANKS, N_EXPERTS, TOPK)),
         TensorSpec("w_gate_up", [N_RANKS, N_LOCAL_EXPERTS, 2 * MOE_INTER, D], torch.int8,
                    init_value=lambda: w_gu_i8),
         TensorSpec("w_gate_up_scale", [N_RANKS, N_LOCAL_EXPERTS, 2 * MOE_INTER], torch.float32,
@@ -444,6 +478,7 @@ if __name__ == "__main__":
         fn=l3_prefill_layer,
         specs=build_tensor_specs(args.num_tokens, num_ranks=num_ranks),
         golden_fn=golden_prefill_layer,
+        input_validator=validate_tp_inputs,
         config=dict(
             dump_passes=args.dump_passes,
             platform=args.platform,
@@ -472,8 +507,10 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "assert_replicated_batch",
     "golden_prefill_layer",
     "l2_prefill_layer",
     "l3_prefill_layer",
     "moe_layer_add",
+    "validate_tp_inputs",
 ]

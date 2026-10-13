@@ -64,11 +64,16 @@ import torch
 
 # ``--tp`` / ``--ep`` are read from argv by config.py at import time and every
 # sub-kernel inherits the frozen shapes. config.py's own default is the 16-die
-# deployment shape, while the CI sweeps run each entry at its default world size
-# (ep2 / 2-card, see ``# ci: devices=2``), so pin that bring-up default before
-# the first ``models.glm5_3_flash`` import when the command line pins neither
-# axis. The EP test additionally asserts that the device count matches EP_SIZE.
-if not any(tok in ("--tp", "--ep") or tok.startswith(("--tp=", "--ep=")) for tok in sys.argv):
+# deployment shape, while the CI sweeps run this entry at its default world size
+# (ep2 / 2-card, see ``# ci: devices=2``), so a standalone run pins that bring-up
+# default before the first ``models.glm5_3_flash`` import when the command line
+# pins neither axis. Only a standalone run may: an *import* must not repoint the
+# importing process, whose config.py may already be frozen at its own default,
+# or the effect would silently depend on import order. The EP test additionally
+# asserts that the device count matches EP_SIZE.
+if __name__ == "__main__" and not any(
+    tok in ("--tp", "--ep") or tok.startswith(("--tp=", "--ep=")) for tok in sys.argv
+):
     sys.argv += ["--tp", "2", "--ep", "2"]
 from models.glm5_3_flash.config import D, EP_SIZE, FLASH, N_LOCAL_EXPERTS, TOPK
 from models.glm5_3_flash.expert_routed import expert_routed
