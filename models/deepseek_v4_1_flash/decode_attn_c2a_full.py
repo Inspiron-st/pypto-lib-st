@@ -89,7 +89,6 @@ SPARSE_WIDTH = WINDOW + INDEX_TOPK
 ATTEND_TILE = 64
 SPARSE_PARTS = SPARSE_WIDTH // ATTEND_TILE
 QUERY_TILE = 32
-GATHER_WORKERS = 8
 
 # Indexer selection. Candidates are scored one leaf at a time and folded into a
 # running Top-K, which keeps the sort width independent of the context length.
@@ -463,13 +462,10 @@ def index_select(
                         low_sign = pl.cast(pl.shrs(low, 3), pl.FP32)
                         low_exponent = pl.cast(pl.shrs(pl.ands(low, 7), 1), pl.FP32)
                         low_fraction = pl.cast(pl.ands(low, 1), pl.FP32)
-                        # 2**e over e in 0..3 is exactly (e**3 + 5e + 6) / 6, which avoids an
-                        # unsupported integer cast on the exponent-assembly path.
-                        low_pow2 = pl.div(
-                            pl.add(pl.add(pl.mul(pl.mul(low_exponent, low_exponent), low_exponent),
-                                          pl.mul(low_exponent, 5.0)), 6.0),
-                            6.0,
-                        )
+                        # Assemble the exact FP32 exponent for E2M1 exponent codes 0..3.
+                        low_exponent_i32 = pl.cast(pl.shrs(pl.ands(low, 7), 1), pl.INT32)
+                        low_exponent_bits = pl.shls(pl.add(low_exponent_i32, 127), 23)
+                        low_pow2 = pl.reinterpret_view(low_exponent_bits, pl.FP32)
                         low_normal = pl.mul(pl.mul(low_pow2, 0.5), pl.add(pl.mul(low_fraction, 0.5), 1.0))
                         low_is_normal = pl.minimum(low_exponent, 1.0)
                         low_magnitude = pl.add(
@@ -480,13 +476,10 @@ def index_select(
                         high_sign = pl.cast(pl.shrs(high, 3), pl.FP32)
                         high_exponent = pl.cast(pl.shrs(pl.ands(high, 7), 1), pl.FP32)
                         high_fraction = pl.cast(pl.ands(high, 1), pl.FP32)
-                        # 2**e over e in 0..3 is exactly (e**3 + 5e + 6) / 6, which avoids an
-                        # unsupported integer cast on the exponent-assembly path.
-                        high_pow2 = pl.div(
-                            pl.add(pl.add(pl.mul(pl.mul(high_exponent, high_exponent), high_exponent),
-                                          pl.mul(high_exponent, 5.0)), 6.0),
-                            6.0,
-                        )
+                        # Assemble the exact FP32 exponent for E2M1 exponent codes 0..3.
+                        high_exponent_i32 = pl.cast(pl.shrs(pl.ands(high, 7), 1), pl.INT32)
+                        high_exponent_bits = pl.shls(pl.add(high_exponent_i32, 127), 23)
+                        high_pow2 = pl.reinterpret_view(high_exponent_bits, pl.FP32)
                         high_normal = pl.mul(pl.mul(high_pow2, 0.5), pl.add(pl.mul(high_fraction, 0.5), 1.0))
                         high_is_normal = pl.minimum(high_exponent, 1.0)
                         high_magnitude = pl.add(
@@ -578,7 +571,19 @@ def gather_sparse(
     active: pl.Scalar[pl.INT32],
     chunk_done: pl.Scalar[pl.TASK_ID],
 ):
-    """Materialize one chunk's window and compressed KV rows in one dense buffer."""
+    """Gather and dequantize sliding-window FP8 and compressed FP4 KV rows."""
+    workers = 16
+    if active >= 16:
+        workers = 4
+    elif active >= 8:
+        workers = 8
+
+    with pl.spmd(active, name_hint="c2a_sparse_plan", deps=[chunk_done]) as plan_tid:
+        r = pl.tile.get_block_idx()
+        t = chunk_start + r
+        combined[r : r + 1, 0:WINDOW] = window_indices[t : t + 1, :]
+        combined[r : r + 1, WINDOW:SPARSE_WIDTH] = topk_indices[t : t + 1, :]
+
     window_rows = pl.tensor.dim(window_cache, 0) * 128
     window_flat = pl.reshape(window_cache, [window_rows, HEAD_DIM])
     window_scale_flat = pl.reshape(window_scales, [window_rows, HEAD_DIM // 32])
@@ -586,101 +591,81 @@ def gather_sparse(
     compressed_flat = pl.reshape(compressed_cache, [compressed_rows, CMP_PACKED])
     compressed_scale_flat = pl.reshape(compressed_scales, [compressed_rows, CMP_SCALES])
     gathered = pl.reshape(selected, [QUERY_TILE * SPARSE_WIDTH, HEAD_DIM])
-    with pl.spmd(active, name_hint="c2a_sparse_plan", deps=[chunk_done]) as plan_tid:
-        r = pl.tile.get_block_idx()
-        t = chunk_start + r
-        combined[r : r + 1, 0:WINDOW] = window_indices[t : t + 1, :]
-        combined[r : r + 1, WINDOW:SPARSE_WIDTH] = topk_indices[t : t + 1, :]
-    with pl.spmd(active * GATHER_WORKERS, name_hint="c2a_window_gather", deps=[plan_tid]):
+    with pl.spmd(active * workers, name_hint="c2a_sparse_gather", deps=[plan_tid]) as gather_tid:
         block = pl.tile.get_block_idx()
-        r = block // GATHER_WORKERS
+        r = block // workers
+        lane = block % workers
         t = chunk_start + r
-        for i in pl.range(block % GATHER_WORKERS * (WINDOW // GATHER_WORKERS),
-                          block % GATHER_WORKERS * (WINDOW // GATHER_WORKERS) + WINDOW // GATHER_WORKERS):
-            row_i32 = pl.read(window_indices, [t, i])
-            dst = r * SPARSE_WIDTH + i
-            if row_i32 >= 0:
-                row = pl.cast(row_i32, pl.INDEX)
-                value = pl.reshape(pl.cast(window_flat[row : row + 1, :], pl.FP32), [HEAD_DIM // 32, 32])
-                scale_row = pl.slice(
-                    window_scale_flat, [1, 32], [row, 0], valid_shape=[1, HEAD_DIM // 32]
-                )
-                raw_codes = pl.reinterpret_view(scale_row, pl.UINT8)
-                signed_codes = pl.cast(pl.reinterpret_view(raw_codes, pl.INT8), pl.INT32)
-                codes = pl.ands(signed_codes, 255)
-                scale_values = pl.reinterpret_view(
-                    pl.maximum(pl.shls(codes, 23), E8M0_FLOOR_BITS), pl.FP32
-                )
-                scale = pl.reshape(scale_values[:, : HEAD_DIM // 32], [HEAD_DIM // 32, 1])
-                decoded = pl.cast(pl.row_expand_mul(value, scale), pl.BF16, mode="rint")
-                gathered[dst : dst + 1, :] = pl.reshape(decoded, [1, HEAD_DIM])
+        window_start = lane * (WINDOW // workers)
+        window_end = window_start + WINDOW // workers
+        for i in pl.range(window_start, window_end):
+            window_index = pl.read(window_indices, [t, i])
+            window_dst = r * SPARSE_WIDTH + i
+            if window_index >= 0:
+                window_row = pl.cast(window_index, pl.INDEX)
+                window_values = pl.cast(window_flat[window_row : window_row + 1, :], pl.FP32)
+                window_values = pl.reshape(window_values, [HEAD_DIM // 32, 32])
+                scale_raw = pl.slice(window_scale_flat, [1, 32], [window_row, 0], valid_shape=[1, HEAD_DIM // 32])
+                scale_codes = pl.reinterpret_view(scale_raw, pl.UINT8)
+                scale_codes = pl.reinterpret_view(scale_codes, pl.INT8)
+                scale_codes = pl.ands(pl.cast(scale_codes, pl.INT32), 255)
+                scale_bits = pl.maximum(pl.shls(scale_codes, 23), E8M0_FLOOR_BITS)
+                window_scale = pl.reinterpret_view(scale_bits, pl.FP32)
+                window_scale = pl.reshape(window_scale[:, : HEAD_DIM // 32], [HEAD_DIM // 32, 1])
+                window_decoded = pl.row_expand_mul(window_values, window_scale)
+                window_decoded = pl.cast(window_decoded, pl.BF16, mode="rint")
+                gathered[window_dst : window_dst + 1, :] = pl.reshape(window_decoded, [1, HEAD_DIM])
             else:
-                gathered[dst : dst + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-    with pl.spmd(active * GATHER_WORKERS, name_hint="c2a_compressed_gather", deps=[plan_tid]) as gather_tid:
-        block = pl.tile.get_block_idx()
-        r = block // GATHER_WORKERS
-        t = chunk_start + r
-        for i in pl.range(block % GATHER_WORKERS * (INDEX_TOPK // GATHER_WORKERS),
-                          block % GATHER_WORKERS * (INDEX_TOPK // GATHER_WORKERS)
-                          + INDEX_TOPK // GATHER_WORKERS):
-            row_i32 = pl.read(topk_indices, [t, i])
-            dst = r * SPARSE_WIDTH + WINDOW + i
-            if row_i32 >= 0:
-                row = pl.cast(row_i32, pl.INDEX)
-                packed = compressed_flat[row : row + 1, :]
-                wide = pl.reinterpret_view(pl.cast(packed, target_type=pl.UINT16), pl.INT16)
+                gathered[window_dst : window_dst + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
+
+        compressed_start = lane * (INDEX_TOPK // workers)
+        compressed_end = compressed_start + INDEX_TOPK // workers
+        for i in pl.pipeline(compressed_start, compressed_end, stage=2):
+            compressed_index = pl.read(topk_indices, [t, i])
+            compressed_dst = r * SPARSE_WIDTH + WINDOW + i
+            if compressed_index >= 0:
+                compressed_row = pl.cast(compressed_index, pl.INDEX)
+                packed = compressed_flat[compressed_row : compressed_row + 1, :]
+                wide = pl.reinterpret_view(pl.cast(packed, pl.UINT16), pl.INT16)
                 low = pl.ands(wide, 15)
                 high = pl.ands(pl.shrs(wide, 4), 15)
+
+                # E2M1 magnitudes: 0, 0.5, 1, 1.5, 2, 3, 4, 6.
+                low_magnitude = pl.cast(pl.ands(low, 7), pl.FP32)
+                low_base = pl.mul(low_magnitude, 0.5)
+                low_excess4 = pl.maximum(pl.sub(low_magnitude, 4.0), 0.0)
+                low_excess6 = pl.maximum(pl.sub(low_magnitude, 6.0), 0.0)
+                low_value = pl.add(low_base, pl.mul(low_excess4, 0.5))
+                low_value = pl.add(low_value, low_excess6)
                 low_sign = pl.cast(pl.shrs(low, 3), pl.FP32)
-                low_exponent = pl.cast(pl.shrs(pl.ands(low, 7), 1), pl.FP32)
-                low_fraction = pl.cast(pl.ands(low, 1), pl.FP32)
-                # 2**e over e in 0..3 is exactly (e**3 + 5e + 6) / 6, which avoids an
-                # unsupported integer cast on the exponent-assembly path.
-                low_pow2 = pl.div(
-                    pl.add(pl.add(pl.mul(pl.mul(low_exponent, low_exponent), low_exponent),
-                                  pl.mul(low_exponent, 5.0)), 6.0),
-                    6.0,
-                )
-                low_normal = pl.mul(pl.mul(low_pow2, 0.5), pl.add(pl.mul(low_fraction, 0.5), 1.0))
-                low_is_normal = pl.minimum(low_exponent, 1.0)
-                low_magnitude = pl.add(
-                    pl.mul(low_is_normal, low_normal),
-                    pl.mul(pl.mul(pl.sub(low_is_normal, 1.0), -1.0), pl.mul(low_fraction, 0.5)),
-                )
-                low_value = pl.mul(low_magnitude, pl.mul(pl.sub(pl.mul(low_sign, 2.0), 1.0), -1.0))
+                low_sign = pl.add(pl.mul(low_sign, -2.0), 1.0)
+                low_value = pl.mul(low_value, low_sign)
+
+                high_magnitude = pl.cast(pl.ands(high, 7), pl.FP32)
+                high_base = pl.mul(high_magnitude, 0.5)
+                high_excess4 = pl.maximum(pl.sub(high_magnitude, 4.0), 0.0)
+                high_excess6 = pl.maximum(pl.sub(high_magnitude, 6.0), 0.0)
+                high_value = pl.add(high_base, pl.mul(high_excess4, 0.5))
+                high_value = pl.add(high_value, high_excess6)
                 high_sign = pl.cast(pl.shrs(high, 3), pl.FP32)
-                high_exponent = pl.cast(pl.shrs(pl.ands(high, 7), 1), pl.FP32)
-                high_fraction = pl.cast(pl.ands(high, 1), pl.FP32)
-                # 2**e over e in 0..3 is exactly (e**3 + 5e + 6) / 6, which avoids an
-                # unsupported integer cast on the exponent-assembly path.
-                high_pow2 = pl.div(
-                    pl.add(pl.add(pl.mul(pl.mul(high_exponent, high_exponent), high_exponent),
-                                  pl.mul(high_exponent, 5.0)), 6.0),
-                    6.0,
-                )
-                high_normal = pl.mul(pl.mul(high_pow2, 0.5), pl.add(pl.mul(high_fraction, 0.5), 1.0))
-                high_is_normal = pl.minimum(high_exponent, 1.0)
-                high_magnitude = pl.add(
-                    pl.mul(high_is_normal, high_normal),
-                    pl.mul(pl.mul(pl.sub(high_is_normal, 1.0), -1.0), pl.mul(high_fraction, 0.5)),
-                )
-                high_value = pl.mul(high_magnitude, pl.mul(pl.sub(pl.mul(high_sign, 2.0), 1.0), -1.0))
-                interleaved = pl.full([1, HEAD_DIM], dtype=pl.FP32, value=0.0)
-                interleaved = pl.tensor.scatter(
-                    low_value, mask_pattern=pl.tile.MaskPattern.P0101, dst=interleaved
-                )
-                interleaved = pl.tensor.scatter(
-                    high_value, mask_pattern=pl.tile.MaskPattern.P1010, dst=interleaved
-                )
-                factors = pl.cast(compressed_scale_flat[row : row + 1, :], pl.FP32)
-                scaled = pl.row_expand_mul(
-                    pl.reshape(interleaved, [CMP_SCALES, 16]), pl.reshape(factors, [CMP_SCALES, 1])
-                )
-                gathered[dst : dst + 1, :] = pl.reshape(
-                    pl.cast(scaled, pl.BF16, mode="rint"), [1, HEAD_DIM]
-                )
+                high_sign = pl.add(pl.mul(high_sign, -2.0), 1.0)
+                high_value = pl.mul(high_value, high_sign)
+
+                low_lanes = pl.full([1, HEAD_DIM], dtype=pl.FP32, value=0.0)
+                high_lanes = pl.full([1, HEAD_DIM], dtype=pl.FP32, value=0.0)
+                low_lanes = pl.tensor.scatter(low_value, mask_pattern=pl.tile.MaskPattern.P0101, dst=low_lanes)
+                high_lanes = pl.tensor.scatter(high_value, mask_pattern=pl.tile.MaskPattern.P1010, dst=high_lanes)
+                low_bits = pl.reinterpret_view(low_lanes, pl.INT32)
+                high_bits = pl.reinterpret_view(high_lanes, pl.INT32)
+                interleaved = pl.reinterpret_view(pl.or_(low_bits, high_bits), pl.FP32)
+                interleaved = pl.reshape(interleaved, [CMP_SCALES, 16])
+                factors = pl.cast(compressed_scale_flat[compressed_row : compressed_row + 1, :], pl.FP32)
+                factors = pl.reshape(factors, [CMP_SCALES, 1])
+                compressed_decoded = pl.row_expand_mul(interleaved, factors)
+                compressed_decoded = pl.cast(compressed_decoded, pl.BF16, mode="rint")
+                gathered[compressed_dst : compressed_dst + 1, :] = pl.reshape(compressed_decoded, [1, HEAD_DIM])
             else:
-                gathered[dst : dst + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                gathered[compressed_dst : compressed_dst + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
     return gather_tid
 
 
@@ -713,9 +698,11 @@ def make_attend_sparse(*, vector_query=False):
             maximum = pl.full([1, M_TILE], dtype=pl.FP32, value=-1e30)
             denominator = pl.full([1, M_TILE], dtype=pl.FP32, value=0.0)
             numerator = pl.full([M_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
+            # Keep the query tile live across all sparse KV parts.  It is identical
+            # for the ten 64-row parts, so the mixed kernel can reuse one Cube tile.
             q = query_flat[q0 : q0 + M_TILE, :]
             if vector_query:
-                # Route the BF16 query through Vector before the first score push.
+                # An exact BF16 roundtrip requires Vector startup before the first score push.
                 q = pl.cast(pl.cast(q, pl.FP32), pl.BF16, mode="rint")
             for part in pl.range(SPARSE_PARTS):
                 k0 = r * SPARSE_WIDTH + part * ATTEND_TILE
@@ -1206,7 +1193,9 @@ def official_reference_c2a(inputs: dict, *, fp32_output=False) -> dict:
     window_slots = t["window_slots"].long()
     window_valid = window_slots >= 0
     window_rows = window_slots[window_valid]
-    _write_rows(window_cache, window_rows, window_payload.view(torch.uint8)[window_valid], head_dim)
+    # Boolean indexing of Float8 on CPU requires an exact FP32 roundtrip.
+    visible_payload = window_payload.float()[window_valid].to(window_payload.dtype)
+    _write_rows(window_cache, window_rows, visible_payload, head_dim)
     _write_rows(window_cache_scale, window_rows, window_codes[window_valid], head_dim // MX_GROUP)
 
     # c. Ratio-2 compressor: per-channel two-way softmax over the pair, pooled row rounded to
@@ -2074,6 +2063,7 @@ def run_c2a(operator, mode, argv=None, *, ring_heap=None):
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--epochs", type=int, default=1, help="operator calls per dispatch; timing includes all epochs")
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--runtime-dir", help="replay a compatible compiled build without recompiling")
     parser.add_argument("--save-data", action="store_true", help="save validated inputs and golden outputs for replay")
     parser.add_argument("--golden-data", help="replay a compatible data directory containing in/ and out/")
     parser.add_argument("--enable-chip-swimlane", type=int, default=0, choices=range(5))
@@ -2121,6 +2111,7 @@ def run_c2a(operator, mode, argv=None, *, ring_heap=None):
         fn=make_program(operator, capacity, len(devices), args.epochs),
         specs=build_specs(args, mode),
         golden_fn=make_golden(args.epochs),
+        runtime_dir=args.runtime_dir,
         compile_only=args.compile_only,
         save_data=args.save_data,
         golden_data=args.golden_data,
