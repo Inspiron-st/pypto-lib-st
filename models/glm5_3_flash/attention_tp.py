@@ -7,14 +7,13 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
-"""The shared TP all-reduce over row-parallel partial sums.
+"""The common TP all-reduce for attention projections and the dense MLP.
 
 Four kernels finish a layer by producing an FP32 partial of the full hidden width
 rather than a finished activation: ``kda_output``, ``mla_epilog_prefill``,
 ``mla_epilog_decode`` and ``dense_mlp``. All four are row-parallel — they contract
 over a head or intermediate axis that TP split — so each rank holds a summand, and
-the layer is not complete until the group's summands are added. The shared expert
-(``expert_shared.py``) joins the same reduction.
+the layer is not complete until the group's summands are added.
 
 This file owns that addition, once, for all of them.
 

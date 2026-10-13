@@ -386,8 +386,10 @@ def _parse_parallel_size(name: str, default: int) -> int:
 # The deployment target is one Atlas 800 A3 node: 16 dies, TP16 with expert
 # parallelism over the same 16 ranks (vLLM Ascend's `--tensor-parallel-size 16
 # --enable-expert-parallel` recipe). Smaller shapes stay available for bring-up.
-TP_SIZE = _parse_parallel_size("tp", 16)
 EP_SIZE = _parse_parallel_size("ep", 16)
+# A standalone MoE entry selects only EP. Keep the default attention topology
+# compatible with that world without requiring a TP argument for expert kernels.
+TP_SIZE = _parse_parallel_size("tp", EP_SIZE)
 if TP_SIZE not in SUPPORTED_TP_SIZES:
     raise ValueError(f"--tp must be one of {SUPPORTED_TP_SIZES}, got {TP_SIZE}")
 if EP_SIZE not in SUPPORTED_EP_SIZES:

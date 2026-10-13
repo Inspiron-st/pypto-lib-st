@@ -1469,7 +1469,6 @@ def _run_pipeline(
     compile_only: bool,
     runtime_dir: str | None,
     save_data: bool,
-    input_validator: Callable | None,
 ) -> RunResult:
     """Compile / run / validate body behind :func:`run`.
 
@@ -1560,15 +1559,6 @@ def _run_pipeline(
             )
     except ValueError as e:
         return _fail(str(e))
-
-    if input_validator is not None:
-        with _Stage("validate inputs"):
-            values = dict(tensors)
-            values.update({name: spec.to_python() for name, spec in scalar_specs_eff.items()})
-            try:
-                input_validator(values)
-            except (AssertionError, ValueError) as e:
-                return _fail(str(e))
 
     golden_outputs: dict[str, torch.Tensor] | None = None
     if not inputs_only_replay and (golden_fn is not None or golden_data is not None):
@@ -1730,7 +1720,6 @@ def run(
     compile_only: bool = False,
     runtime_dir: str | None = None,
     save_data: bool = False,
-    input_validator: Callable | None = None,
 ) -> RunResult:
     """Compile *fn*, run it on device, and validate against golden.
 
@@ -1777,14 +1766,6 @@ def run(
             Defaults to False, skipping the on-disk ``.pt`` snapshot;
             validation still runs against the in-memory golden. Enable it
             when you need to replay the exact inputs/outputs later.
-        input_validator: Optional read-only ``input_validator(values)`` called
-            after inputs are generated or replayed, before golden computation
-            and device dispatch. ``values`` maps tensor names to the actual
-            dispatch buffers and scalar names to their effective Python values.
-            Raise ``AssertionError`` or ``ValueError`` to return a failed
-            ``RunResult`` without dispatch. Runs even without a golden or when
-            replaying stored outputs; skipped for ``compile_only``. Called once
-            before correctness dispatch, not for benchmark scalar steps.
 
     Returns:
         :class:`RunResult`.
@@ -1808,5 +1789,4 @@ def run(
             compile_only=compile_only,
             runtime_dir=runtime_dir,
             save_data=save_data,
-            input_validator=input_validator,
         )
