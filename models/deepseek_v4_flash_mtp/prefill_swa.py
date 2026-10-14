@@ -10,6 +10,7 @@
 # ci: devices=2
 
 import sys
+from math import gcd
 
 # Standalone CI passes its borrowed device list without a --cp argument.
 # Resolve fixture topology before importing modules that freeze CP shapes.
@@ -494,6 +495,7 @@ AUGMENTED_ROW_TILE = 16
 HC_PADDING_ROWS = 128  # rows seeded per hc_mixed_padding block
 KV_SCATTER_ROWS = 32  # augmented KV rows copied per cp_swa_augmented_kv_scatter block
 assert TAIL_ROWS % KV_SCATTER_ROWS == 0
+HC_PADDING_D_TILE = gcd(4096, D)
 SEGMENT_ROWS = MAX_SEGMENT_TILES * TAIL_ROWS
 
 # Sparse-K blocks the CP-SWA gather actually fills. Its writer stages a column only
@@ -988,9 +990,9 @@ def prefill_attention_swa(
             hc_padding_base = pl.tile.get_block_idx() * HC_PADDING_ROWS
             for hc_padding_row in pl.range(hc_padding_base, hc_padding_base + HC_PADDING_ROWS, 16):
                 if hc_padding_row >= hc_rows:
-                    hc_segment_mixed[hc_padding_row:hc_padding_row + 16, :] = pl.full(
-                        [16, D], dtype=pl.BF16, value=0.0,
-                    )
+                    for padding_d0 in pl.range(0, D, HC_PADDING_D_TILE):
+                        padding_zero = pl.full([16, HC_PADDING_D_TILE], dtype=pl.BF16, value=0.0)
+                        hc_segment_mixed[hc_padding_row:hc_padding_row + 16, padding_d0:padding_d0 + HC_PADDING_D_TILE] = padding_zero
         hc_x = pl.slice(x_flat, [hc_rows, HC_MULT, D], [hc_offset, 0, 0])
         hc_mixed = pl.slice(mixed, [hc_rows, D], [hc_offset, 0])
         hc_post = pl.slice(post, [hc_rows, HC_MULT], [hc_offset, 0])
