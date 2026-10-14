@@ -34,7 +34,9 @@ Sharding
 * **Routed experts are EP-sharded**: rank ``ep_rank`` of ``ep_size`` owns experts
   ``[ep_rank * N_LOCAL, (ep_rank + 1) * N_LOCAL)``, whole tensors — no weight
   slicing inside an expert.
-* **Shared and dense FFNs are TP-sharded on the intermediate axis**: each rank
+* **Shared experts are replicated**: every EP rank loads the complete gate/up
+  and down projections and their per-output-channel scales.
+* **Dense FFNs are TP-sharded on the intermediate axis**: each rank
   keeps ``intermediate / tp_size`` channels of the *fused* layout, i.e. the gate
   head ``[0, local_inter)`` and the up head
   ``[intermediate, intermediate + local_inter)``, and ``w_down``'s matching
@@ -148,11 +150,11 @@ class QuantDescription:
 
 @dataclass(frozen=True)
 class FfnShard:
-    """One FFN's INT8 weights and dequant scales, in kernel layout."""
+    """One FFN's INT8 weights and dequant scales, full or TP-sliced."""
 
-    gate_up: torch.Tensor        # [2 * local_inter, D] INT8, gate rows then up rows
-    gate_up_scale: torch.Tensor  # [2 * local_inter] FP32
-    down: torch.Tensor           # [D, local_inter] INT8
+    gate_up: torch.Tensor        # [2 * inter, D] INT8, gate rows then up rows
+    gate_up_scale: torch.Tensor  # [2 * inter] FP32
+    down: torch.Tensor           # [D, inter] INT8
     down_scale: torch.Tensor     # [D] FP32
 
 
@@ -358,31 +360,22 @@ def _local_intermediate_slice(
     )
 
 
-def shard_shared_expert(
+def load_shared_expert(
     tensors: Mapping[str, torch.Tensor],
     layer_id: int,
-    tp_rank: int,
-    tp_size: int,
-    *,
-    intermediate: int = FLASH.moe_intermediate_size,
-    local_inter: int | None = None,
 ) -> FfnShard:
-    """TP-slice the shared expert's fused layout for one rank."""
-    if tp_size not in SUPPORTED_TP_SIZES:
-        raise ValueError(f"tp_size must be one of {SUPPORTED_TP_SIZES}, got {tp_size}")
-    if not 0 <= tp_rank < tp_size:
-        raise ValueError(f"tp_rank must be in [0, {tp_size}), got {tp_rank}")
-    local = local_inter if local_inter is not None else intermediate // tp_size
-    if intermediate % tp_size:
-        raise ValueError(f"shared intermediate {intermediate} does not divide TP{tp_size}")
+    """Load the complete shared expert replicated on every EP rank."""
     prefixes = layer_prefixes(layer_id)
     gate_up, gate_up_scale, down, down_scale = _fused_ffn(
         tensors, prefixes, ("shared_fused", "shared_fused_down", "shared_gate", "shared_up", "shared_down")
     )
-    return _local_intermediate_slice(
-        gate_up, gate_up_scale, down, down_scale,
-        intermediate=intermediate, local_inter=local, tp_rank=tp_rank,
-    )
+    intermediate = FLASH.moe_intermediate_size
+    if gate_up.shape != (2 * intermediate, D) or down.shape != (D, intermediate):
+        raise ValueError(
+            f"shared weights must have full shapes {(2 * intermediate, D)} and {(D, intermediate)}, "
+            f"got {tuple(gate_up.shape)} and {tuple(down.shape)}"
+        )
+    return FfnShard(gate_up, gate_up_scale, down, down_scale)
 
 
 def shard_dense_mlp(
@@ -535,17 +528,23 @@ if __name__ == "__main__":
         assert separate.w_gate_up_scale.dtype == torch.float32
         assert separate.w_gate_up_scale.shape == (routed_local, 4096)
 
-    # Shared expert: the TP rank keeps the gate head and the up head of its own
-    # channels, and `down` keeps the matching columns.
-    tp_rank = 1
-    shared = shard_shared_expert(sparse_fused, 3, tp_rank, TP_SIZE)
-    local = 2048 // TP_SIZE
-    assert_close(shared.gate_up[:local], shared_pieces[0][local : 2 * local], "shared gate slice")
-    assert_close(shared.gate_up[local:], shared_pieces[1][local : 2 * local], "shared up slice")
-    assert_close(shared.down, shared_pieces[2][:, local : 2 * local], "shared down slice")
+    # Shared expert: every EP rank keeps complete projections and scales.
+    shared = load_shared_expert(sparse_fused, 3)
+    shared_separate = load_shared_expert(sparse_separate, 3)
+    inter = FLASH.moe_intermediate_size
+    assert_close(shared.gate_up[:inter], shared_pieces[0], "shared gate")
+    assert_close(shared.gate_up[inter:], shared_pieces[1], "shared up")
+    assert_close(shared.down, shared_pieces[2], "shared down")
+    assert_close(
+        shared.gate_up_scale,
+        torch.cat([shared_pieces[3].reshape(-1), shared_pieces[4].reshape(-1)]),
+        "shared gate/up scale",
+    )
     assert_close(shared.down_scale, shared_pieces[5].reshape(-1), "shared down scale")
+    for field in ("gate_up", "gate_up_scale", "down", "down_scale"):
+        assert_close(getattr(shared_separate, field), getattr(shared, field), f"shared fused {field}")
 
-    # Dense layer: same rules at the dense width, and the router passes through
+    # Dense layer: TP slices the intermediate width, and the router passes through
     # with the kernels' dtypes.
     dense = shard_dense_mlp(sparse_fused, 0, 0, TP_SIZE)
     local_dense = DENSE_INTER // TP_SIZE
@@ -560,18 +559,18 @@ if __name__ == "__main__":
     assert_close(router.correction_bias, router_bias, "router bias")
 
     # The released checkpoint nests the text backbone under ``language_model``
-    # (``model.language_model.layers.*``); the nested spelling must shard
-    # identically to the canonical one, and an unknown root must still fail.
+    # (``model.language_model.layers.*``); both roots load the same tensors.
     nested = materialize(fused=True, root="model.language_model.layers.")
+    ep_rank = 1
     nested_routed = shard_routed_experts(
-        nested, 3, tp_rank, routed_ep, local_experts=routed_local, global_experts=routed_global
+        nested, 3, ep_rank, routed_ep, local_experts=routed_local, global_experts=routed_global
     )
     canonical_routed = shard_routed_experts(
-        sparse_fused, 3, tp_rank, routed_ep, local_experts=routed_local, global_experts=routed_global
+        sparse_fused, 3, ep_rank, routed_ep, local_experts=routed_local, global_experts=routed_global
     )
     for field in ("w_gate_up", "w_gate_up_scale", "w_down", "w_down_scale"):
         assert_close(getattr(nested_routed, field), getattr(canonical_routed, field), f"nested routed {field}")
-    nested_shared = shard_shared_expert(nested, 3, tp_rank, TP_SIZE)
+    nested_shared = load_shared_expert(nested, 3)
     assert_close(nested_shared.gate_up, shared.gate_up, "nested shared gate_up")
     assert_close(nested_shared.down, shared.down, "nested shared down")
     nested_dense = shard_dense_mlp(nested, 0, 0, TP_SIZE)
@@ -581,7 +580,7 @@ if __name__ == "__main__":
     assert_close(nested_router.weight, canonical_router.weight, "nested router weight")
     assert_close(nested_router.correction_bias, canonical_router.correction_bias, "nested router bias")
     try:
-        shard_shared_expert(materialize(fused=True, root="model.text."), 3, tp_rank, TP_SIZE)
+        load_shared_expert(materialize(fused=True, root="model.text."), 3)
     except KeyError:
         pass
     else:
@@ -613,7 +612,6 @@ if __name__ == "__main__":
     fused_gu = torch.cat([shared_pieces[0], shared_pieces[1]], dim=0)
     fused_gu_scale = torch.cat([shared_pieces[3].reshape(-1), shared_pieces[4].reshape(-1)])
     for bad_call in (
-        lambda: shard_shared_expert(sparse_fused, 3, TP_SIZE, TP_SIZE),
         lambda: shard_dense_mlp(sparse_fused, 0, -1, TP_SIZE),
         lambda: shard_dense_mlp(sparse_fused, 0, 0, TP_SIZE, intermediate=DENSE_INTER + 32),
         # The private helper is reachable directly and carries its own guard.
@@ -655,5 +653,5 @@ if __name__ == "__main__":
         print("[GOLDEN] PASS weights (safetensors round-trip)")
 
     print(
-        f"[GOLDEN] PASS weights (routed 32 experts over EP{routed_ep}, dense/shared TP{TP_SIZE})"
+        f"[GOLDEN] PASS weights (routed 32 experts over EP{routed_ep}, shared replicated, dense TP{TP_SIZE})"
     )

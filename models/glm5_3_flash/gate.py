@@ -81,6 +81,19 @@ def gate_active_rows(num_tokens):
     return max(0, int(num_tokens))
 
 
+def make_correction_bias(num_ranks: int, num_experts: int, topk: int) -> torch.Tensor:
+    """Build a replicated fixture bias with fixed winners spread across EP ranks."""
+    if num_ranks < 1 or num_experts < 1 or num_experts % num_ranks:
+        raise ValueError("num_experts must be positive and divisible by a positive num_ranks")
+    if not 1 <= topk <= num_experts:
+        raise ValueError("topk must be between 1 and num_experts")
+    slots = torch.arange(topk)
+    winners = (slots % num_ranks) * (num_experts // num_ranks) + slots // num_ranks
+    bias = torch.full((num_experts,), -5.0, dtype=torch.float32)
+    bias[winners] = 5.0
+    return bias.unsqueeze(0).expand(num_ranks, -1).contiguous()
+
+
 def golden_gate(
     x: torch.Tensor,
     norm_weight: torch.Tensor,
@@ -424,5 +437,6 @@ if __name__ == "__main__":
 __all__ = [
     "SCORE_PAD",
     "golden_gate",
+    "make_correction_bias",
     "moe_gate",
 ]

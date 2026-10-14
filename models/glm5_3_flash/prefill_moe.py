@@ -34,15 +34,16 @@ payload movement, and the transports are capacity-sized:
 * ``prefill_moe_return`` scatters every live expert row back to the rank that
   routed it (slot ``token * TOPK + k``) and sums the TOPK slots per token.
 
-The barriers are epoch-keyed ``AtomicAdd(1)`` notifies — every rank notifies
-each peer exactly once per phase per call — so ``signal[src] >= epoch`` retires
-call N+1 only after call N's readers, and one set of windows serves every layer
-with no clear. The L3 entry runs two calls to exercise exactly that reuse.
+The barriers are epoch-keyed ``AtomicAdd(1)`` notifies: every rank notifies
+each peer exactly once per phase per call, so ``signal[src] >= epoch`` identifies
+the current phase without clearing the windows. Each rank completes combine
+before starting its next dispatch. The L3 entry repeats the same inputs twice
+to exercise window reuse with successive epochs.
 
 Run (EP2, two ranks)::
 
-    python models/glm5_3_flash/prefill_moe.py -p a2a3sim -d 0,1 --tp 2 --ep 2
-    python models/glm5_3_flash/prefill_moe.py -p a2a3    -d 0,1 --tp 2 --ep 2
+    python models/glm5_3_flash/prefill_moe.py -p a2a3sim -d 0,1 --ep 2
+    python models/glm5_3_flash/prefill_moe.py -p a2a3    -d 0,1 --ep 2
 """
 
 import sys
@@ -52,18 +53,10 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
 
-# ``--tp`` / ``--ep`` are read from argv by config.py at import time and every
-# sub-kernel inherits the frozen shapes. config.py's own default is the 16-die
-# deployment shape, while the CI sweeps run this entry at its default world size
-# (ep2 / 2-card, see ``# ci: devices=2``), so a standalone run pins that bring-up
-# default before the first ``models.glm5_3_flash`` import when the command line
-# pins neither axis. Only a standalone run may: an *import* must not repoint the
-# importing process, whose config.py may already be frozen at its own default,
-# or the effect would silently depend on import order.
-if __name__ == "__main__" and not any(
-    tok in ("--tp", "--ep") or tok.startswith(("--tp=", "--ep=")) for tok in sys.argv
-):
-    sys.argv += ["--tp", "2", "--ep", "2"]
+# Config freezes the EP shapes at import time. Standalone CI runs use EP2;
+# imports leave argv untouched so the surrounding application owns deployment.
+if __name__ == "__main__" and not any(tok == "--ep" or tok.startswith("--ep=") for tok in sys.argv):
+    sys.argv += ["--ep", "2"]
 
 from models.glm5_3_flash.config import D, EP_SIZE, FLASH, N_LOCAL_EXPERTS, TOPK
 from models.glm5_3_flash.expert_routed import expert_routed
@@ -534,9 +527,8 @@ def l3_prefill_moe(
     slot_out_buf = pld.alloc_window_buffer([ROUTES_PER_SRC, D], dtype=pl.FP32)
     return_ready_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
 
-    # Two calls over the same windows: the epoch-keyed barriers only retire
-    # call N+1 after call N's readers, so one call would not cover the
-    # multi-layer reuse this protocol exists for.
+    # Repeat the same inputs with successive epochs to exercise window reuse.
+    # Each rank completes combine before starting its next dispatch.
     for call in pl.range(2):
         for r in pl.range(pld.world_size()):
             lane_x = pld.window(lane_x_buf, [TOTAL_CAP, D], dtype=pl.INT8)
@@ -702,7 +694,6 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
-    parser.add_argument("--tp", type=int, default=2, help="tensor-parallel size (config.py reads argv)")
     parser.add_argument("--ep", type=int, default=2, help="expert-parallel size / rank count")
     parser.add_argument(
         "-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),

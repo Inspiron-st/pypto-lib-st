@@ -19,7 +19,7 @@ without a peer. The stages:
   four scalar fields (scale, weight, route id, local expert) as one 8-wide FP32
   ``remote_store`` into the destination rank's window lane ``my_rank * LANE_CAP + slot``.
 * The per-source lane count goes to ``lane_count[my_rank, 0]`` and the payload
-  barrier ``lane_ready[my_rank, 0]`` is AtomicAdd'ed, so the receiver knows both
+  barrier ``lane_ready[my_rank, 0]`` is set to the epoch, so the receiver knows both
   how many rows arrived and that the puts retired.
 * ``moe_arrive`` waits on every peer's ``lane_ready``, then flattens its own
   window lanes source-major into the arrival arrays.
@@ -27,15 +27,15 @@ without a peer. The stages:
   (``route = t * TOPK + k``) and bars with ``return_ready`` before the source
   reduces its slots.
 
-Lane capacity is the dropless bound ``T * TOPK`` per (source, destination), the
-same contract ``decode_moe.py`` uses. ``T`` is the decode capacity of the layer
+Lane capacity is the dropless bound ``T * TOPK`` per (source, destination).
+``T`` is the decode capacity of the layer
 this entry serves, not the active token count, so a run with fewer active tokens
 still exercises the full cursor arithmetic.
 
 Run (EP2, two ranks)::
 
-    python models/glm5_3_flash/decode_moe.py -p a2a3sim -d 0,1 --tp 2 --ep 2 --num-tokens 16
-    python models/glm5_3_flash/decode_moe.py -p a2a3    -d 0,1 --tp 2 --ep 2 --num-tokens 16
+    python models/glm5_3_flash/decode_moe.py -p a2a3sim -d 0,1 --ep 2 --num-tokens 16
+    python models/glm5_3_flash/decode_moe.py -p a2a3    -d 0,1 --ep 2 --num-tokens 16
 
 Loopback (one device, no transport)::
 
@@ -46,9 +46,9 @@ so an EP2 run needs about 3.6 GB of INT8 weights per rank. Verified at EP2 in
 ``a2a3sim`` and on two Ascend910 dies; the EP16 acceptance run needs 16 dies.
 
 The barriers are epoch-keyed ``Set`` notifies: every rank is the single writer
-of its own signal row, so ``lane_ready[src] >= epoch`` retires call N+1 only
-after call N's readers, and one set of windows serves every layer with no
-``clear``. The L3 entry runs two calls to exercise exactly that reuse.
+of its own signal row, and ``lane_ready[src] >= epoch`` distinguishes the current
+call from earlier notifications without clearing the signal windows. The L3
+entry repeats the same inputs twice over one set of windows with distinct epochs.
 
 Open items: ``T`` is the entry's decode capacity, so a 128-token production call
 raises it (and the window sizes with it); and the per-destination route scans in
@@ -62,19 +62,13 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
 
-# ``--tp`` / ``--ep`` are read from argv by config.py at import time and every
-# sub-kernel inherits the frozen shapes. config.py's own default is the 16-die
-# deployment shape, while the CI sweeps run this entry at its default world size
-# (ep2 / 2-card, see ``# ci: devices=2``), so a standalone run pins that bring-up
-# default before the first ``models.glm5_3_flash`` import when the command line
-# pins neither axis. Only a standalone run may: an *import* must not repoint the
-# importing process, whose config.py may already be frozen at its own default,
-# or the effect would silently depend on import order. The EP test additionally
-# asserts that the device count matches EP_SIZE.
+# MoE's frozen expert layout follows --ep. Standalone CI uses two ranks while
+# config.py defaults to the 16-rank deployment; pin only that entry's EP default
+# before model imports. Importing this module must leave the caller's argv intact.
 if __name__ == "__main__" and not any(
-    tok in ("--tp", "--ep") or tok.startswith(("--tp=", "--ep=")) for tok in sys.argv
+    tok == "--ep" or tok.startswith("--ep=") for tok in sys.argv
 ):
-    sys.argv += ["--tp", "2", "--ep", "2"]
+    sys.argv += ["--ep", "2"]
 from models.glm5_3_flash.config import D, EP_SIZE, FLASH, N_LOCAL_EXPERTS, TOPK
 from models.glm5_3_flash.expert_routed import expert_routed
 from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX
@@ -492,9 +486,8 @@ def l3_decode_moe(
     slot_out_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.FP32)
     return_ready_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
 
-    # Two calls over the same windows: the epoch-keyed barriers only retire
-    # call N+1 after call N's readers, so one call would not cover the
-    # multi-layer reuse this protocol exists for.
+    # Repeat the same inputs with successive epochs to exercise window reuse.
+    # Each rank completes combine before starting its next dispatch.
     for call in pl.range(2):
         for r in pl.range(pld.world_size()):
             lane_x = pld.window(lane_x_buf, [LANE_ROWS, D], dtype=pl.INT8)
@@ -645,7 +638,7 @@ def build_tensor_specs(num_tokens=T, *, loopback=False, num_ranks=EP_SIZE):
     num_tokens = max(0, min(T, int(num_tokens)))
 
     def init_route_indices():
-        # Global expert ids spread across both ranks so both lanes move data.
+        # Global expert ids spread across the EP ranks so peer lanes move data.
         # Loopback has no peers, so every route has to land on this rank.
         gen = torch.Generator().manual_seed(7)
         bound = N_LOCAL_EXPERTS if loopback else N_RANKS * N_LOCAL_EXPERTS
@@ -699,7 +692,6 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
-    parser.add_argument("--tp", type=int, default=2, help="tensor-parallel size (config.py reads argv)")
     parser.add_argument("--ep", type=int, default=2, help="expert-parallel size / rank count")
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
                         help=f"comma-separated device ids (need {N_RANKS})")
