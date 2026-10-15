@@ -8,14 +8,14 @@ paths:
 Apply these rules when adding, modifying, or reviewing code under `models/`.
 Existing code is not a template when it conflicts with these rules. Keep
 cleanup scoped to the changed operator and its affected callers.
+Review-only tasks must not edit or clean up files unless fixes were requested.
 
 ## File ownership
 
 - **Operator files** normally contain the kernel implementation first, its
   corresponding Torch golden second, and validation setup and an executable
   CI entry point last. Small operators such as RMSNorm may contain only
-  kernels, without a golden or executable entry point; validate them through
-  their consumers where appropriate.
+  kernels; a separate golden or executable entry point is not required.
 - **Decode and prefill** should normally have separate files for the same
   operator, especially for large operators. Their shapes and performance
   requirements can require different tiling, scheduling, and buffers. Small
@@ -35,7 +35,7 @@ cleanup scoped to the changed operator and its affected callers.
 File dependencies must form an acyclic graph. Parent operators import child
 operators, never the reverse. Kernel and golden implementations must follow
 this same dependency direction; a child must not import its parent's golden
-or validation helpers.
+or validation helpers. These constraints also apply to function-local imports.
 
 Decode and prefill files must not depend on each other. Put small shared
 operators in independent child operator files and shared host helpers in
@@ -43,12 +43,21 @@ utilities. Do not hide dependency cycles with deferred imports.
 
 ## Reuse and replacement
 
-Before adding compute code, inspect existing implementations and their callers
-within the current model. Layer and forward entries should compose existing
-operators instead of copying their compute logic. When fusion or performance
-specialization requires a separate implementation, explain the differences
-and validation evidence in the change report. This does not require merging
-decode and prefill implementations with different shape or performance needs.
+Reuse suitable kernels, host utilities, and validation tools already present
+in the repository. Their absence from the current conversation context does
+not justify reimplementing them. Separate implementations require a concrete
+semantic, dependency, or measured performance need; explain why existing
+capabilities cannot meet it. Do not couple independent model directories just
+to reuse a helper.
+
+Layer and forward entries must compose existing operators instead of copying
+their compute logic. Fusion or different decode and prefill requirements may
+justify separate implementations under the same requirement above.
+
+New files, public entry points, and wrappers require a concrete consumer or
+contract that existing owners and entries cannot reasonably support. Do not
+create a parallel composition or validation interface solely to demonstrate
+a capability.
 
 When replacing or migrating an implementation, update affected callers and
 remove obsolete implementations, parameters, exports, validation entries, and
@@ -56,39 +65,22 @@ documentation in the same change. Retain old interfaces or forwarding wrappers
 only for an explicit compatibility requirement. A staged migration must identify
 the remaining consumers and the conditions for completing the migration.
 
+## Scope and compatibility
+
+Keep additions of documentation, tests, and benchmarks to what the requested
+change clearly needs. Prefer existing documentation and validation entry
+points; keep one-off experiment material in PRs or artifacts.
+
+Preserve agreed operator contracts and implementation constraints, including
+dtypes, scale encoding, layout, quantization boundaries, sharding, and state
+ownership. Intentional contract changes must update affected callers,
+including drafts. Do not silently change interfaces or relax acceptance
+criteria. Do not claim compatibility or capabilities based on a removed
+implementation or evidence from a different source or scope.
+
 ## Coding style
 
-Follow the rules in the [`fmt-coding-style` workflow](../skills/fmt-coding-style/SKILL.md)
-for new or modified model code, including golden and validation code.
-Pay particular attention to parameter grouping and line breaks. Apply the
-workflow's documented exceptions; do not substitute a formatter's defaults.
-Run a whole-file style pass only when requested or explicitly required by the
-active workflow. During review-only tasks, check compliance and report findings
-without applying edits unless fixes were requested.
-
-## Default validation
-
-Use the existing [golden harness](../../docs/run-and-validate/golden-harness.md)
-for executable operator files. A default invocation should, where applicable,
-validate a bounded set of meaningful scenarios covering relevant shapes,
-branches, and boundaries on the selected platform and devices. Validate each
-case and make the invocation fail if any case fails.
-
-Support performance configurations through explicit options, rather than as
-validation defaults. Large benchmark shapes and repeated timing sweeps must
-not replace the default correctness suite. Keep case selection and defaults
-in the owning executable file, not in model configuration.
-
-When implementing or optimizing models, avoid changing `tests/` unless the
-model change specifically requires it.
-
-## Agent checklist
-
-Before editing, inspect the affected operator's imports and callers and choose
-its owning file according to these rules. Before finishing an implementation
-change, check both kernel and golden dependency directions, ensure changed
-code follows the formatting rules, check for duplicated compute and obsolete code left by replacements,
-and verify the relevant standalone or composition entry. Report which
-default scenarios were exercised and any validation not run.
-For review-only tasks, use this checklist to assess the change and report
-findings; do not perform edits or cleanup.
+New or modified code must follow the
+[`fmt-coding-style` workflow](../skills/fmt-coding-style/SKILL.md), including
+golden and validation code. Do not broaden a routine change into whole-file
+formatting unless requested or required by the active workflow.
