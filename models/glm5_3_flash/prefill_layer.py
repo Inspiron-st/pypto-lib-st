@@ -18,7 +18,7 @@ A GLM-5.3-Flash MoE layer has two branches, assembled as in ``decode_layer.py``:
   ``expert_shared.py`` produces the local FP32 result without cross-rank reduction.
 
 ``moe_layer_add`` adds these local results and zeros inactive capacity rows. The
-router is the head of the block: ``moe_gate`` provides deferred norm, routing and
+router is the head of the block: ``moe_gate`` provides RMSNorm, routing and
 an INT8 activation view that both branches reuse. Each rank may supply a different
 batch; the expert weights are not tensor-parallel.
 
@@ -145,7 +145,7 @@ def l2_prefill_layer(
     x_int8 = pl.create_tensor([T, D], dtype=pl.INT8)
     x_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
 
-    # Block head: deferred norm + router + the INT8 view both branches reuse.
+    # Block head: normalized router and the INT8 view both branches reuse.
     moe_gate(
         x_mixed, norm_weight, gate_weight, correction_bias,
         route_weights, route_indices, x_int8, x_scale, num_tokens,
@@ -307,7 +307,18 @@ def golden_prefill_layer(tensors):
     tensors["y"][:] = out
 
 
-def build_tensor_specs(num_tokens=T, *, num_ranks=EP_SIZE):
+def build_tensor_specs(num_tokens=T, *, num_ranks=EP_SIZE, checkpoint=None, layer_id=3, hidden=None):
+    """Build generated fixtures or load a checkpoint's complete MoE FFN weights."""
+    if checkpoint is not None:
+        from models.glm5_3_flash.utils import build_checkpoint_moe_specs
+
+        return build_checkpoint_moe_specs(
+            checkpoint, layer_id,
+            capacity=T, num_tokens=num_tokens, num_ranks=num_ranks, hidden=hidden,
+        )
+    if hidden is not None:
+        raise ValueError("hidden activations require checkpoint weights")
+
     from golden import ScalarSpec, TensorSpec
 
     num_tokens = max(0, min(T, int(num_tokens)))
@@ -407,11 +418,21 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
                         help=f"comma-separated device ids (need {N_RANKS})")
     parser.add_argument("--tokens", type=int, default=T, help="per-rank token capacity (module level)")
-    parser.add_argument("--num-tokens", type=int, default=T)
+    parser.add_argument("--num-tokens", type=int, default=None, help="active rows; defaults to hidden rows or capacity")
+    parser.add_argument("--checkpoint", type=Path, help="W8A8 checkpoint directory; default: generated weights")
+    parser.add_argument("--layer", type=int, default=3, help="checkpoint MoE layer index (default: 3)")
+    parser.add_argument("--hidden", type=Path, help="saved BF16 [EP, active tokens, D] x_mixed; requires --checkpoint")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
+
+    if args.hidden is not None and args.checkpoint is None:
+        parser.error("--hidden requires --checkpoint")
+    hidden = torch.load(args.hidden, map_location="cpu", weights_only=True) if args.hidden is not None else None
+    if hidden is not None and (not isinstance(hidden, torch.Tensor) or hidden.ndim != 3):
+        parser.error("--hidden must contain a BF16 tensor shaped [EP, active tokens, D]")
+    num_tokens = args.num_tokens if args.num_tokens is not None else (hidden.shape[1] if hidden is not None else T)
 
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) == N_RANKS, f"need exactly {N_RANKS} devices, got {device_ids}"
@@ -419,7 +440,9 @@ if __name__ == "__main__":
 
     result = run(
         fn=l3_prefill_layer,
-        specs=build_tensor_specs(args.num_tokens, num_ranks=num_ranks),
+        specs=build_tensor_specs(
+            num_tokens, num_ranks=num_ranks, checkpoint=args.checkpoint, layer_id=args.layer, hidden=hidden,
+        ),
         golden_fn=golden_prefill_layer,
         config=dict(
             dump_passes=args.dump_passes,
