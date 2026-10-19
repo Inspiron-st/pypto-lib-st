@@ -137,7 +137,7 @@ def decode_c2a_full(
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     q_proj_qr(x_norm, wq_a, wq_a_scale, q_norm_weight, qr, num_tokens)
-    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens)
+    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens, max_workers=2147483647)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_proj_rope(x_norm, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, window_kv, num_tokens)
     publish_window_row(window_kv, window_slots, window_cache, window_cache_scale, num_tokens)
@@ -179,7 +179,11 @@ def decode_c2a_full(
         chunk_done = attend_c2a_chunk(query, selected, combined, attn_sink, attended, start, active, gather_tid)
 
     partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
-    o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens)
+    o_proj(
+        attended, wo_a, wo_a_scale, wo_b,
+        wo_b_scale, rope_cos, rope_sin,
+        partial, num_tokens, grouped_max_workers=4096,
+    )
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     with pl.spmd(tokens, name_hint="c2a_output_cast"):
         row = pl.tile.get_block_idx()

@@ -131,14 +131,18 @@ def prefill_swa_attention(
                 chunk_sin[row:row + 1, :] = rope_sin[source_row:source_row + 1, :]
                 chunk_indices[row:row + 1, :] = window_indices[source_row:source_row + 1, :]
         q_proj_qr(chunk_x, wq_a, wq_a_scale, q_norm_weight, qr, active)
-        q_proj_rope(qr, wq_b, wq_b_scale, chunk_cos, chunk_sin, q, active)
+        q_proj_rope(qr, wq_b, wq_b_scale, chunk_cos, chunk_sin, q, active, max_workers=2147483647)
         index_ready = analyze_index_runs(chunk_indices, descriptors, active, cache_rows)
         attend_shared_cache(
             q, decoded_cache, zero_row,
             descriptors, chunk_indices, attn_sink,
             attended, active, decoded_ready, index_ready,
         )
-        o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, chunk_cos, chunk_sin, chunk_partial, active)
+        o_proj(
+            attended, wo_a, wo_a_scale, wo_b,
+            wo_b_scale, chunk_cos, chunk_sin,
+            chunk_partial, active, grouped_max_workers=4096,
+        )
         with pl.spmd(WORKER_TILE, name_hint="prefill_swa_collect") as collect_tid:
             worker = pl.tile.get_block_idx()
             for row in pl.range(worker, active, WORKER_TILE):
