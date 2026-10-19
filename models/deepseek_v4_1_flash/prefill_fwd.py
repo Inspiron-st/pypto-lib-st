@@ -35,7 +35,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
-from pypto.runtime import RunConfig, StackedDeviceTensor
+from pypto.backend import BackendType
+from pypto.runtime import ExecutionMode, RunConfig, StackedDeviceTensor
 import torch
 
 import config as C
@@ -1049,7 +1050,7 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
         raise ValueError("checkpoint EOS token is missing from its tokenizer")
     weights = ResidentPrefillWeights(checkpoint, ep_size=RANKS)
     config = RunConfig(
-        platform="a5", ring_heap=2 * 1024**3,
+        backend_type=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD, ring_heap=2 * 1024**3,
         distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
     )
     outputs = {
@@ -1283,7 +1284,7 @@ if __name__ == "__main__":
         torch.set_num_threads(8)
         checkpoint = PrefillCheckpoint(options.checkpoint)
         compiled = DistributedCompiledProgram.from_dir(
-            options.runtime_dir, platform="a5",
+            options.runtime_dir, backend_type=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD,
             distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
         )
         report = generate(
@@ -1295,12 +1296,12 @@ if __name__ == "__main__":
         print("CED_GENERATION_COMPLETE", json.dumps(report, ensure_ascii=False), flush=True)
     else:
         from utils import upload_forward_inputs
-        from golden import run
+        from golden import normalize_config, run
         from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
-        from pypto.runtime import RunConfig
 
         parser = argparse.ArgumentParser(description=__doc__)
-        parser.add_argument("-p", "--platform", default="a5", choices=["a5"])
+        parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
+        parser.add_argument("--sim", dest="execution_mode", action="store_true")
         parser.add_argument("--tp", type=int, default=C.TP_SIZE, choices=[1])
         parser.add_argument("--ep", type=int, default=RANKS, choices=[2, 4, 8])
         parser.add_argument("--dp", type=int, default=RANKS, choices=[2, 4, 8])
@@ -1312,6 +1313,8 @@ if __name__ == "__main__":
         parser.add_argument("--enable-scope-stats", action="store_true")
         parser.add_argument("--log-level", default=None)
         args = parser.parse_args()
+        if args.execution_mode:
+            parser.error("this forward entry requires hardware; --sim is unsupported")
         if (args.tp, args.ep, args.dp, args.experts_per_rank, args.capacity) != (1, RANKS, RANKS, LOCAL_EXPERTS, CAPACITY):
             parser.error("parallel sizes, expert count and capacity must match the import-time configuration")
         devices = [int(device) for device in args.device.split(",") if device]
@@ -1319,7 +1322,8 @@ if __name__ == "__main__":
             parser.error(f"need exactly {RANKS} distinct devices, got {devices}")
         specs = build_tensor_specs()
         config = dict(
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             dump_passes=args.dump_passes,
             enable_scope_stats=args.enable_scope_stats,
             log_level=args.log_level,
@@ -1334,8 +1338,10 @@ if __name__ == "__main__":
             compile_only=True,
         )
         if result.passed and not args.compile_only:
-            cfg = RunConfig(**{name: value for name, value in config.items() if name != "log_level"})
-            compiled = DistributedCompiledProgram.from_dir(result.work_dir, platform=cfg.platform)
+            cfg = normalize_config(config)
+            compiled = DistributedCompiledProgram.from_dir(
+                result.work_dir, backend_type=cfg.backend_type, execution_mode=cfg.execution_mode,
+            )
             host_inputs = {}
             upload_buffer = torch.empty(64 * 1024**2, dtype=torch.uint8).share_memory_()
             inherited = [*host_inputs.values(), upload_buffer]

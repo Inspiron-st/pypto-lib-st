@@ -27,7 +27,7 @@ from golden.runner import (
     RunResult,
     _bench_loop_sizes,
     _format_stale_paths,
-    _normalize_config,
+    normalize_config,
     _ordered_args,
     _prepare_inputs,
     _report_bench,
@@ -1266,13 +1266,51 @@ class TestPlatformResolution:
         ],
     )
     def test_known_platforms(self, platform, expected_name):
-        cfg = _normalize_config({"platform": platform})
+        cfg = normalize_config({"platform": platform})
         assert cfg.platform == platform
         assert cfg.backend_type.name == expected_name
 
     def test_unknown_platform_raises_valueerror(self):
         with pytest.raises(ValueError, match="Invalid platform"):
-            _normalize_config({"platform": "notaplatform"})
+            normalize_config({"platform": "notaplatform"})
+
+    @pytest.mark.parametrize("backend", ["a2a3", "a5"])
+    @pytest.mark.parametrize("sim", [False, True])
+    def test_cli_target_values_reach_compiler_as_enums(self, backend, sim):
+        from pypto.backend import BackendType
+        from pypto.runtime import ExecutionMode
+
+        config = dict(backend_type=backend, execution_mode=sim, device_id=3)
+        cfg = normalize_config(config)
+        assert config == dict(backend_type=backend, execution_mode=sim, device_id=3)
+        assert cfg.platform == backend + ("sim" if sim else "")
+        assert cfg.device_id == 3
+        expected_backend = BackendType.Ascend950 if backend == "a5" else BackendType.Ascend910B
+        expected_mode = ExecutionMode.SIM if sim else ExecutionMode.ONBOARD
+        assert cfg.backend_type == expected_backend
+        assert cfg.execution_mode == expected_mode
+        assert cfg.compile_kwargs()["backend_type"] == expected_backend
+        assert cfg.compile_kwargs()["execution_mode"] == expected_mode
+        assert "platform" not in cfg.compile_kwargs()
+
+    def test_explicit_target_enums_and_ready_config_are_preserved(self):
+        from pypto.backend import BackendType
+        from pypto.runtime import ExecutionMode
+
+        cfg = normalize_config(dict(backend_type=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD))
+        assert cfg.backend_type == BackendType.Ascend950
+        assert cfg.execution_mode == ExecutionMode.ONBOARD
+        assert normalize_config(cfg) is cfg
+
+    @pytest.mark.parametrize("backend", ["a5sim", "unknown"])
+    def test_invalid_chip_string_is_rejected(self, backend):
+        with pytest.raises(ValueError, match="Invalid backend_type"):
+            normalize_config(dict(backend_type=backend, execution_mode=False))
+
+    @pytest.mark.parametrize("mode", ["sim", 0, 1])
+    def test_non_boolean_non_enum_mode_is_rejected(self, mode):
+        with pytest.raises(TypeError):
+            normalize_config(dict(backend_type="a2a3", execution_mode=mode))
 
 
 class TestRunResultStr:
@@ -2811,11 +2849,11 @@ def test_explicit_target_config_matches_legacy_platform(platform):
     from pypto.backend import BackendType
     from pypto.runtime import ExecutionMode
 
-    explicit = _normalize_config({
+    explicit = normalize_config({
         "backend_type": BackendType.Ascend950 if platform.startswith("a5") else BackendType.Ascend910B,
         "execution_mode": ExecutionMode.SIM if platform.endswith("sim") else ExecutionMode.ONBOARD,
     })
-    legacy = _normalize_config({"platform": platform})
+    legacy = normalize_config({"platform": platform})
     assert explicit.platform == legacy.platform
     assert explicit.compile_kwargs() == legacy.compile_kwargs()
 
