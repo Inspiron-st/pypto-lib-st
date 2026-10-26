@@ -55,9 +55,10 @@ if __package__ in (None, ""):
 import pypto.language as pl
 import torch
 
-from models.glm5_3_flash.config import BLOCK_SIZE, D, INDEX_DIM, INDEX_H
+from models.glm5_3_flash.config import BLOCK_SIZE, D, INDEX_BLOCKS_DYN, INDEX_DIM, INDEX_H
 from models.glm5_3_flash.config import INDEX_KPOOL, INDEX_STATE_BLOCK_SIZE
 from models.glm5_3_flash.config import INDEX_STATE_WIDTH, KPOOL_SELECT_K, KV_LORA, LOCAL_H, POOLS_DYN
+from models.glm5_3_flash.config import POOL_EVENTS_DYN, POOL_PAGES_DYN
 from models.glm5_3_flash.config import Q_LORA, TABLE_DYN, TOPK_INDEX_WIDTH, T_DYN
 from models.glm5_3_flash.decode_sparse_attn import decode_sparse_attn_test
 from models.glm5_3_flash.decode_sparse_attn import golden_decode_sparse_attn_case
@@ -87,18 +88,18 @@ def decode_indexer_step_test(
     hadamard: pl.Tensor[[INDEX_DIM, INDEX_DIM], pl.BF16],
     compress_ape: pl.Tensor[[INDEX_KPOOL, INDEX_DIM], pl.BF16],
     index_slots: pl.Tensor[[T_DYN], pl.INT32],
-    pool_token_slots: pl.Tensor[[POOLS_DYN, INDEX_KPOOL], pl.INT32],
-    pool_slots: pl.Tensor[[POOLS_DYN], pl.INT32],
-    pool_blocks: pl.Tensor[[POOLS_DYN], pl.INT32],
+    pool_token_slots: pl.Tensor[[POOL_EVENTS_DYN, INDEX_KPOOL], pl.INT32],
+    pool_slots: pl.Tensor[[POOL_EVENTS_DYN], pl.INT32],
+    pool_blocks: pl.Tensor[[POOL_PAGES_DYN], pl.INT32],
     seg_start: pl.Tensor[[T_DYN], pl.INT32],
     pool_count: pl.Tensor[[T_DYN], pl.INT32],
     tail_start: pl.Tensor[[T_DYN], pl.INT32],
     tail_count: pl.Tensor[[T_DYN], pl.INT32],
     kv_len: pl.Tensor[[T_DYN], pl.INT32],
     raw_cache: pl.InOut[pl.Tensor[[TABLE_DYN * BLOCK_SIZE, INDEX_STATE_WIDTH], pl.FP32]],
-    pool_cache: pl.InOut[pl.Tensor[[POOLS_DYN, INDEX_DIM], pl.INT8]],
-    pool_scale: pl.InOut[pl.Tensor[[POOLS_DYN, POOL_SCALE_WIDTH], pl.FP32]],
-    pool_valid: pl.Out[pl.Tensor[[POOLS_DYN, POOL_VALID_WIDTH], pl.INT32]],
+    pool_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.INT8]],
+    pool_scale: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, POOL_SCALE_WIDTH], pl.FP32]],
+    pool_valid: pl.Out[pl.Tensor[[POOL_EVENTS_DYN, POOL_VALID_WIDTH], pl.INT32]],
     index_q: pl.Out[pl.Tensor[[T_DYN, INDEX_H, INDEX_DIM], pl.BF16]],
     index_k: pl.Out[pl.Tensor[[T_DYN, INDEX_DIM], pl.BF16]],
     head_weights: pl.Out[pl.Tensor[[T_DYN, INDEX_H], pl.FP32]],
@@ -122,10 +123,12 @@ def decode_indexer_step_test(
     tail_start.bind_dynamic(0, T_DYN)
     tail_count.bind_dynamic(0, T_DYN)
     kv_len.bind_dynamic(0, T_DYN)
-    pool_token_slots.bind_dynamic(0, POOLS_DYN)
-    pool_slots.bind_dynamic(0, POOLS_DYN)
-    pool_blocks.bind_dynamic(0, POOLS_DYN)
-    pool_valid.bind_dynamic(0, POOLS_DYN)
+    pool_token_slots.bind_dynamic(0, POOL_EVENTS_DYN)
+    pool_slots.bind_dynamic(0, POOL_EVENTS_DYN)
+    pool_blocks.bind_dynamic(0, POOL_PAGES_DYN)
+    pool_valid.bind_dynamic(0, POOL_EVENTS_DYN)
+    pool_cache.bind_dynamic(0, INDEX_BLOCKS_DYN)
+    pool_scale.bind_dynamic(0, INDEX_BLOCKS_DYN)
     index_q.bind_dynamic(0, T_DYN)
     index_k.bind_dynamic(0, T_DYN)
     head_weights.bind_dynamic(0, T_DYN)

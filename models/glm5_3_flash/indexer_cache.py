@@ -66,7 +66,7 @@ import torch
 
 from models.glm5_3_flash.config import BLOCK_SIZE, INDEX_BLOCKS_DYN, INDEX_DIM
 from models.glm5_3_flash.config import INDEX_KPOOL, INDEX_STATE_BLOCK_SIZE
-from models.glm5_3_flash.config import INDEX_STATE_WIDTH, POOLS_DYN, TABLE_DYN, T_DYN
+from models.glm5_3_flash.config import INDEX_STATE_WIDTH, POOL_EVENTS_DYN, TABLE_DYN, T_DYN
 from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX
 from models.glm5_3_flash.quantization import quantize_per_token_int8
 
@@ -202,9 +202,9 @@ def golden_indexer_pool_write(
 def _indexer_pool_write_event(
     raw_cache: pl.Tensor[[TABLE_DYN * BLOCK_SIZE, INDEX_STATE_WIDTH], pl.FP32],
     compress_ape: pl.Tensor[[INDEX_KPOOL, INDEX_DIM], pl.BF16],
-    pool_token_slots: pl.Tensor[[POOLS_DYN, INDEX_KPOOL], pl.INT32],
-    pool_stage: pl.Tensor[[POOLS_DYN, INDEX_DIM], pl.FP32],
-    pool_valid: pl.Tensor[[POOLS_DYN, POOL_VALID_WIDTH], pl.INT32],
+    pool_token_slots: pl.Tensor[[POOL_EVENTS_DYN, INDEX_KPOOL], pl.INT32],
+    pool_stage: pl.Tensor[[POOL_EVENTS_DYN, INDEX_DIM], pl.FP32],
+    pool_valid: pl.Tensor[[POOL_EVENTS_DYN, POOL_VALID_WIDTH], pl.INT32],
 ) -> None:
     """Close one pool event; the caller gives this scope one block per event.
 
@@ -270,11 +270,11 @@ def indexer_pool_write(
     raw_cache: pl.Tensor[[TABLE_DYN * BLOCK_SIZE, INDEX_STATE_WIDTH], pl.FP32],
     compress_ape: pl.Tensor[[INDEX_KPOOL, INDEX_DIM], pl.BF16],
     hadamard: pl.Tensor[[INDEX_DIM, INDEX_DIM], pl.BF16],
-    pool_token_slots: pl.Tensor[[POOLS_DYN, INDEX_KPOOL], pl.INT32],
-    pool_slots: pl.Tensor[[POOLS_DYN], pl.INT32],
+    pool_token_slots: pl.Tensor[[POOL_EVENTS_DYN, INDEX_KPOOL], pl.INT32],
+    pool_slots: pl.Tensor[[POOL_EVENTS_DYN], pl.INT32],
     pool_cache: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.INT8],
     pool_scale: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, POOL_SCALE_WIDTH], pl.FP32],
-    pool_valid: pl.Tensor[[POOLS_DYN, POOL_VALID_WIDTH], pl.INT32],
+    pool_valid: pl.Tensor[[POOL_EVENTS_DYN, POOL_VALID_WIDTH], pl.INT32],
 ):
     """Write one quantized pooled key row per pool-close event.
 
@@ -348,16 +348,16 @@ def indexer_pool_write_test(
     raw_cache: pl.Tensor[[TABLE_DYN * BLOCK_SIZE, INDEX_STATE_WIDTH], pl.FP32],
     compress_ape: pl.Tensor[[INDEX_KPOOL, INDEX_DIM], pl.BF16],
     hadamard: pl.Tensor[[INDEX_DIM, INDEX_DIM], pl.BF16],
-    pool_token_slots: pl.Tensor[[POOLS_DYN, INDEX_KPOOL], pl.INT32],
-    pool_slots: pl.Tensor[[POOLS_DYN], pl.INT32],
+    pool_token_slots: pl.Tensor[[POOL_EVENTS_DYN, INDEX_KPOOL], pl.INT32],
+    pool_slots: pl.Tensor[[POOL_EVENTS_DYN], pl.INT32],
     pool_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.INT8]],
     pool_scale: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, POOL_SCALE_WIDTH], pl.FP32]],
-    pool_valid: pl.Out[pl.Tensor[[POOLS_DYN, POOL_VALID_WIDTH], pl.INT32]],
+    pool_valid: pl.Out[pl.Tensor[[POOL_EVENTS_DYN, POOL_VALID_WIDTH], pl.INT32]],
 ):
     """Close every pool event of one dispatch for golden.run validation."""
-    pool_token_slots.bind_dynamic(0, POOLS_DYN)
-    pool_slots.bind_dynamic(0, POOLS_DYN)
-    pool_valid.bind_dynamic(0, POOLS_DYN)
+    pool_token_slots.bind_dynamic(0, POOL_EVENTS_DYN)
+    pool_slots.bind_dynamic(0, POOL_EVENTS_DYN)
+    pool_valid.bind_dynamic(0, POOL_EVENTS_DYN)
     indexer_pool_write(
         raw_cache, compress_ape, hadamard, pool_token_slots, pool_slots, pool_cache, pool_scale, pool_valid
     )

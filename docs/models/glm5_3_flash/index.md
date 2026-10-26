@@ -76,6 +76,22 @@ where DeepSeek-V4.1 uses `sqrt(softplus(.))`, and 288 experts do not fit the
 the pad has to grow to 512 and the `pl.sort32` + `pl.mrgsort` merge tree gains a
 level.
 
+## Indexer dimensions
+
+The indexer uses separate dynamic symbols for independent pool dimensions:
+
+| Symbol | Extent |
+| --- | --- |
+| `POOL_EVENTS_DYN` | Pool-write events in `pool_token_slots`, `pool_slots`, and `pool_valid` |
+| `POOL_PAGES_DYN` | Entries in the gathered `pool_blocks` page table |
+| `POOLS_DYN` | Columns in `index_scores` |
+| `INDEX_BLOCKS_DYN` | Physical blocks backing `pool_cache` and `pool_scale` |
+
+For example, the default decode fixture has 16 write events, 1024 page-table
+entries, and 4096 score columns. A shared dynamic symbol requires equal
+extents; binding these quantities to one symbol can underallocate the gather
+scratch. Its live row count is `POOL_PAGES_DYN * INDEX_STATE_BLOCK_SIZE`.
+
 ## Deployment target
 
 One Atlas 800 A3 node, 16 dies, TP16 with expert parallelism over the same 16

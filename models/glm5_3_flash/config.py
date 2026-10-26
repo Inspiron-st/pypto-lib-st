@@ -305,6 +305,10 @@ TABLE_DYN = pl.dynamic("GLM53_TABLE_DYN")
 BLOCK_TABLE_DYN = pl.dynamic("GLM53_BLOCK_TABLE_DYN")
 KV_BLOCKS_DYN = pl.dynamic("GLM53_KV_BLOCKS_DYN")
 INDEX_BLOCKS_DYN = pl.dynamic("GLM53_INDEX_BLOCKS_DYN")
+# Pool-write events, gathered page-table entries, and score columns have
+# independent extents, including when all three occur in one indexer step.
+POOL_EVENTS_DYN = pl.dynamic("GLM53_POOL_EVENTS_DYN")
+POOL_PAGES_DYN = pl.dynamic("GLM53_POOL_PAGES_DYN")
 POOLS_DYN = pl.dynamic("GLM53_POOLS_DYN")
 # Depth of a KDA recurrent- or conv-state pool. This is the pool's row count, not
 # the batch size: ``kda_state_rows`` exists precisely so a request can sit on any
